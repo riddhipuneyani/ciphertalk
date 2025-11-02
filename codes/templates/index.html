@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CipherTalk - Secure Messaging</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h1>🔐 CipherTalk</h1>
+                <div class="user-info">
+                    <div id="current-user" class="current-user">Not logged in</div>
+                    <button id="logout-btn" class="btn-secondary" style="display: none;">Logout</button>
+                </div>
+            </div>
+            
+            <div class="login-section" id="login-section">
+                <h2>Login</h2>
+                <input type="text" id="username-input" placeholder="Enter username" class="input-field">
+                <button id="login-btn" class="btn-primary">Login</button>
+            </div>
+            
+            <div class="conversations-section" id="conversations-section" style="display: none;">
+                <h2>Conversations</h2>
+                <div id="users-list" class="users-list"></div>
+                <div class="sidebar-actions">
+                    <button id="view-encryptions-btn" class="btn-secondary">🔒 View Encryptions</button>
+                    <button id="view-analytics-btn" class="btn-secondary">📊 Analytics</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Main Chat Area -->
+        <div class="main-content">
+            <div class="chat-header" id="chat-header" style="display: none;">
+                <h2 id="chat-recipient">Select a user to start chatting</h2>
+                <div class="chat-actions">
+                    <button id="voice-btn" class="btn-icon" title="Voice to Text">🎤</button>
+                    <button id="summarize-btn" class="btn-icon" title="Summarize Last Message">📝</button>
+                </div>
+            </div>
+            
+            <div class="chat-messages" id="chat-messages">
+                <div class="welcome-message">
+                    <h3>Welcome to CipherTalk</h3>
+                    <p>Login and select a user to start a secure conversation</p>
+                </div>
+            </div>
+            
+            <div class="chat-input-section" id="chat-input-section" style="display: none;">
+                <div class="input-container">
+                    <input type="text" id="message-input" placeholder="Type a message..." class="message-input">
+                    <button id="send-btn" class="btn-primary">Send</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Modals -->
+        <div id="encryptions-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <span class="close">&times;</span>
+                <h2>Encryption History</h2>
+                <div id="encryptions-list" class="encryptions-list"></div>
+            </div>
+        </div>
+        
+        <div id="analytics-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <span class="close">&times;</span>
+                <h2>Analytics Dashboard</h2>
+                <div id="analytics-content" class="analytics-content"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+

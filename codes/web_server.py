@@ -1,0 +1,447 @@
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit, join_room, leave_room
+import threading
+import json
+import base64
+import time
+from datetime import datetime
+import uuid
+from functools import wraps
+from collections import defaultdict
+
+from crypto import generate_key_pair, encrypt_message, decrypt_message, sign_message, verify_signature
+
+# Optional AI imports - server will work without them
+try:
+    from ai import voice_to_text, summarize_text
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+    print("Warning: AI features (voice-to-text, summarization) are not available. Install dependencies: pip install speechrecognition spacy vosk pyaudio")
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'ciphertalk-secret-key-change-in-production'
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Store active users and their socket connections
+active_users = {}  # {username: {'socket_id': id, 'public_key': key}}
+messages_store = []  # Store all messages for history
+encryptions_log = []  # Store encryption operations
+
+# Rate limiting for API calls
+api_call_times = {}  # {endpoint: {ip: [timestamps]}}
+
+def rate_limit(max_calls=10, period=60):
+    """Rate limiting decorator"""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            endpoint = request.endpoint
+            client_ip = request.remote_addr
+            
+            now = time.time()
+            key = f"{endpoint}:{client_ip}"
+            
+            if key not in api_call_times:
+                api_call_times[key] = []
+            
+            # Remove old timestamps
+            api_call_times[key] = [t for t in api_call_times[key] if now - t < period]
+            
+            # Check rate limit
+            if len(api_call_times[key]) >= max_calls:
+                return jsonify({'error': 'Rate limit exceeded. Please slow down.'}), 429
+            
+            # Add current timestamp
+            api_call_times[key].append(now)
+            
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# Load/save keys helper
+def load_keys(username):
+    try:
+        with open(f"{username}_private.pem", "rb") as f:
+            private_key = f.read()
+        with open(f"{username}_public.pem", "rb") as f:
+            public_key = f.read()
+        return private_key, public_key
+    except FileNotFoundError:
+        return None, None
+
+def save_keys(private_key, public_key, username):
+    with open(f"{username}_private.pem", "wb") as f:
+        f.write(private_key)
+    with open(f"{username}_public.pem", "wb") as f:
+        f.write(public_key)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/register', methods=['POST'])
+def api_register():
+    data = request.json
+    username = data.get('username')
+    
+    if not username:
+        return jsonify({'error': 'Username required'}), 400
+    
+    # Generate or load keys
+    private_key, public_key = load_keys(username)
+    if not private_key:
+        print(f"Generating new key pair for {username}...")
+        private_key, public_key = generate_key_pair()
+        save_keys(private_key, public_key, username)
+    
+    return jsonify({
+        'success': True,
+        'username': username,
+        'public_key': base64.b64encode(public_key).decode('utf-8')
+    })
+
+@app.route('/api/users', methods=['GET'])
+@rate_limit(max_calls=5, period=10)  # Max 5 calls per 10 seconds
+def api_get_users():
+    users = [{'username': user, 'online': True} for user in active_users.keys()]
+    return jsonify({'users': users})
+
+@app.route('/api/messages', methods=['GET'])
+@rate_limit(max_calls=5, period=10)  # Max 5 calls per 10 seconds
+def api_get_messages():
+    username = request.args.get('username')
+    current_user = request.args.get('current_user')
+    
+    if username:
+        # Get messages between current_user and username
+        filtered = [m for m in messages_store 
+                   if (m['sender'] == current_user and m['recipient'] == username) or
+                      (m['sender'] == username and m['recipient'] == current_user)]
+        return jsonify({'messages': filtered})
+    
+    return jsonify({'messages': messages_store})
+
+@app.route('/api/encryptions', methods=['GET'])
+def api_get_encryptions():
+    username = request.args.get('username')
+    if username:
+        filtered = [e for e in encryptions_log if e['sender'] == username or e['recipient'] == username]
+        return jsonify({'encryptions': filtered})
+    return jsonify({'encryptions': encryptions_log})
+
+@app.route('/api/analytics', methods=['GET'])
+def api_get_analytics():
+    # Calculate analytics
+    total_messages = len(messages_store)
+    total_encryptions = len(encryptions_log)
+    unique_users = set()
+    for msg in messages_store:
+        unique_users.add(msg['sender'])
+        unique_users.add(msg['recipient'])
+    
+    # Messages by user
+    messages_by_user = {}
+    for msg in messages_store:
+        messages_by_user[msg['sender']] = messages_by_user.get(msg['sender'], 0) + 1
+    
+    top_sender = max(messages_by_user.items(), key=lambda x: x[1])[0] if messages_by_user else None
+    
+    # Encryption timing statistics
+    encryption_times = [enc.get('encryption_time_ms', 0) for enc in encryptions_log if 'encryption_time_ms' in enc]
+    avg_encryption_time = sum(encryption_times) / len(encryption_times) if encryption_times else 0
+    min_encryption_time = min(encryption_times) if encryption_times else 0
+    max_encryption_time = max(encryption_times) if encryption_times else 0
+    
+    # Encryption time over time (for graph)
+    encryption_time_series = []
+    if encryptions_log:
+        # Group by hour for the last 24 hours
+        time_groups = defaultdict(list)
+        now = datetime.now()
+        
+        for enc in encryptions_log:
+            if 'timestamp' in enc and 'encryption_time_ms' in enc:
+                try:
+                    enc_time = datetime.fromisoformat(enc['timestamp'])
+                    # Group by hour
+                    hour_key = enc_time.strftime('%Y-%m-%d %H:00')
+                    time_groups[hour_key].append(enc['encryption_time_ms'])
+                except:
+                    pass
+        
+        # Calculate average per hour
+        for hour_key in sorted(time_groups.keys())[-24:]:  # Last 24 hours
+            avg_time = sum(time_groups[hour_key]) / len(time_groups[hour_key])
+            encryption_time_series.append({
+                'time': hour_key,
+                'avg_time_ms': round(avg_time, 3),
+                'count': len(time_groups[hour_key])
+            })
+    
+    # Message size statistics
+    message_sizes = [enc.get('message_size_bytes', 0) for enc in encryptions_log if 'message_size_bytes' in enc]
+    avg_message_size = sum(message_sizes) / len(message_sizes) if message_sizes else 0
+    
+    # Messages per hour
+    messages_per_hour = defaultdict(int)
+    for msg in messages_store:
+        if 'timestamp' in msg:
+            try:
+                msg_time = datetime.fromisoformat(msg['timestamp'])
+                hour_key = msg_time.strftime('%Y-%m-%d %H:00')
+                messages_per_hour[hour_key] += 1
+            except:
+                pass
+    
+    # Messages per hour series (for graph)
+    messages_per_hour_series = []
+    for hour_key in sorted(messages_per_hour.keys())[-24:]:  # Last 24 hours
+        messages_per_hour_series.append({
+            'time': hour_key,
+            'count': messages_per_hour[hour_key]
+        })
+    
+    # Encryption types
+    encryption_types = {}
+    for enc in encryptions_log:
+        enc_type = enc.get('encryption_type', 'Unknown')
+        encryption_types[enc_type] = encryption_types.get(enc_type, 0) + 1
+    
+    # Performance metrics
+    encryption_times_sorted = sorted(encryption_times) if encryption_times else []
+    median_encryption_time = encryption_times_sorted[len(encryption_times_sorted) // 2] if encryption_times_sorted else 0
+    
+    return jsonify({
+        'total_messages': total_messages,
+        'total_encryptions': total_encryptions,
+        'unique_users': len(unique_users),
+        'top_sender': top_sender,
+        'messages_by_user': messages_by_user,
+        'encryption_types': encryption_types,
+        'encryption_timing': {
+            'avg_ms': round(avg_encryption_time, 3),
+            'min_ms': round(min_encryption_time, 3),
+            'max_ms': round(max_encryption_time, 3),
+            'median_ms': round(median_encryption_time, 3),
+            'total_samples': len(encryption_times)
+        },
+        'encryption_time_series': encryption_time_series,
+        'message_stats': {
+            'avg_size_bytes': round(avg_message_size, 2),
+            'total_size_bytes': sum(message_sizes)
+        },
+        'messages_per_hour': messages_per_hour_series
+    })
+
+@socketio.on('connect')
+def handle_connect():
+    print(f'Client connected: {request.sid}')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f'Client disconnected: {request.sid}')
+    # Remove user from active users
+    username = None
+    if hasattr(socketio, 'user_sessions'):
+        username = socketio.user_sessions.get(request.sid)
+        del socketio.user_sessions[request.sid]
+    
+    if not username:
+        for user, data in list(active_users.items()):
+            if data.get('socket_id') == request.sid:
+                username = user
+                break
+    
+    if username and username in active_users:
+        del active_users[username]
+        socketio.emit('user_left', {'username': username}, broadcast=True)
+
+@socketio.on('register')
+def handle_register(data):
+    username = data.get('username')
+    public_key_b64 = data.get('public_key')
+    
+    if username:
+        # Load or get public key
+        if public_key_b64:
+            public_key = base64.b64decode(public_key_b64)
+        else:
+            _, public_key = load_keys(username)
+            if not public_key:
+                _, public_key = generate_key_pair()
+                save_keys(_, public_key, username)
+        
+        active_users[username] = {
+            'socket_id': request.sid,
+            'public_key': public_key,
+            'joined_at': datetime.now().isoformat()
+        }
+        # Store username in session-like way (using a dict since session doesn't work well with socketio)
+        if not hasattr(socketio, 'user_sessions'):
+            socketio.user_sessions = {}
+        socketio.user_sessions[request.sid] = username
+        emit('registration_success', {'username': username, 'public_key': base64.b64encode(public_key).decode('utf-8')})
+        # Only broadcast to other users, not the registering user
+        socketio.emit('user_joined', {'username': username}, broadcast=True, include_self=False)
+        print(f'User {username} registered (Socket ID: {request.sid})')
+
+@socketio.on('get_public_key')
+def handle_get_public_key(data):
+    recipient = data.get('recipient')
+    username = socketio.user_sessions.get(request.sid) if hasattr(socketio, 'user_sessions') else None
+    
+    if recipient in active_users:
+        public_key = active_users[recipient]['public_key']
+        emit('public_key_response', {
+            'recipient': recipient,
+            'public_key': base64.b64encode(public_key).decode('utf-8'),
+            'status': 'success'
+        })
+    else:
+        emit('public_key_response', {
+            'recipient': recipient,
+            'status': 'error',
+            'message': 'User not found'
+        })
+
+@socketio.on('send_message')
+def handle_send_message(data):
+    sender = socketio.user_sessions.get(request.sid) if hasattr(socketio, 'user_sessions') else None
+    if not sender:
+        emit('error', {'message': 'Not authenticated'})
+        return
+    
+    recipient = data.get('recipient')
+    message_text = data.get('message')
+    
+    if not recipient or not message_text:
+        emit('error', {'message': 'Recipient and message required'})
+        return
+    
+    # Get recipient's public key
+    if recipient not in active_users:
+        emit('error', {'message': 'Recipient not online'})
+        return
+    
+    recipient_public_key = active_users[recipient]['public_key']
+    sender_private_key, _ = load_keys(sender)
+    
+    if not sender_private_key:
+        emit('error', {'message': 'Sender keys not found'})
+        return
+    
+    try:
+        # Track encryption time
+        import time as time_module
+        encryption_start = time_module.perf_counter()
+        
+        # Encrypt message
+        signature = sign_message(message_text, sender_private_key)
+        encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
+        
+        # Calculate encryption time
+        encryption_end = time_module.perf_counter()
+        encryption_time_ms = (encryption_end - encryption_start) * 1000  # Convert to milliseconds
+        
+        # Track message size
+        message_size = len(message_text.encode('utf-8'))
+        
+        # Log encryption with timing data
+        encryption_record = {
+            'id': str(uuid.uuid4()),
+            'timestamp': datetime.now().isoformat(),
+            'sender': sender,
+            'recipient': recipient,
+            'encryption_type': 'RSA-AES-GCM',
+            'encryption_time_ms': round(encryption_time_ms, 3),
+            'message_size_bytes': message_size,
+            'session_key_encrypted': base64.b64encode(encrypted_session_key).decode('utf-8'),
+            'nonce': base64.b64encode(nonce).decode('utf-8'),
+            'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+            'tag': base64.b64encode(tag).decode('utf-8'),
+            'signature': base64.b64encode(signature).decode('utf-8')
+        }
+        encryptions_log.append(encryption_record)
+        
+        # Create message object
+        message_obj = {
+            'id': str(uuid.uuid4()),
+            'timestamp': datetime.now().isoformat(),
+            'sender': sender,
+            'recipient': recipient,
+            'message': message_text,
+            'encrypted_content': {
+                'session_key': base64.b64encode(encrypted_session_key).decode('utf-8'),
+                'nonce': base64.b64encode(nonce).decode('utf-8'),
+                'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+                'tag': base64.b64encode(tag).decode('utf-8')
+            },
+            'signature': base64.b64encode(signature).decode('utf-8')
+        }
+        
+        messages_store.append(message_obj)
+        
+        # Send to recipient if online
+        recipient_socket_id = active_users[recipient]['socket_id']
+        socketio.emit('new_message', {
+            'sender': sender,
+            'message': message_text,
+            'encrypted_content': message_obj['encrypted_content'],
+            'signature': message_obj['signature'],
+            'timestamp': message_obj['timestamp'],
+            'id': message_obj['id']
+        }, room=recipient_socket_id)
+        
+        # Confirm to sender
+        emit('message_sent', {
+            'recipient': recipient,
+            'message': message_text,
+            'timestamp': message_obj['timestamp'],
+            'id': message_obj['id']
+        })
+        
+        # Removed message_update broadcast - it was causing spam API calls
+        
+    except Exception as e:
+        emit('error', {'message': f'Failed to send message: {str(e)}'})
+        print(f"Error sending message: {e}")
+
+@socketio.on('voice_message')
+def handle_voice_message(data):
+    sender = socketio.user_sessions.get(request.sid) if hasattr(socketio, 'user_sessions') else None
+    if not sender:
+        emit('error', {'message': 'Not authenticated'})
+        return
+    
+    recipient = data.get('recipient')
+    
+    # Use voice_to_text function
+    if not AI_AVAILABLE:
+        emit('error', {'message': 'Voice-to-text feature is not available. Please install required dependencies.'})
+        return
+    
+    try:
+        text_input = voice_to_text()
+        if text_input:
+            # Send the converted text as a message
+            handle_send_message({
+                'recipient': recipient,
+                'message': text_input
+            })
+            emit('voice_converted', {'text': text_input})
+        else:
+            emit('error', {'message': 'Voice conversion failed'})
+    except Exception as e:
+        emit('error', {'message': f'Voice conversion error: {str(e)}'})
+
+if __name__ == '__main__':
+    print("=" * 50)
+    print("Starting CipherTalk Web Server...")
+    print("=" * 50)
+    print("\n📱 Open http://localhost:5000 in your browser")
+    print("🔐 Secure messaging with end-to-end encryption")
+    print("🎤 Voice-to-text support included")
+    print("=" * 50 + "\n")
+    socketio.run(app, debug=True, port=5000, host='0.0.0.0')
+

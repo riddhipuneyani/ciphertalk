@@ -1,0 +1,58 @@
+═══════════════════════════════════════════════════════════════
+  HOW TO RUN CIPHERTALK - CORRECT WAY
+═══════════════════════════════════════════════════════════════
+
+❌ DON'T DO THIS:
+   - Opening index.html directly in browser
+   - Double-clicking index.html file
+   
+✅ DO THIS INSTEAD:
+
+STEP 1: Start the Python Server
+   Open PowerShell/Terminal in the "codes" folder and run:
+   
+   python web_server.py
+   
+   You should see:
+   ==================================================
+   Starting CipherTalk Web Server...
+   ==================================================
+   
+   📱 Open http://localhost:5000 in your browser
+   
+STEP 2: Open in Browser
+   Open your web browser (Chrome, Firefox, Edge, etc.)
+   Go to this address:
+   
+   http://localhost:5000
+   
+   NOT the file path! Use the URL http://localhost:5000
+
+STEP 3: Test the App
+   - Enter a username
+   - Click Login
+   - Start chatting!
+
+═══════════════════════════════════════════════════════════════
+
+WHY NOT OPEN HTML DIRECTLY?
+   
+   The index.html file uses Flask template syntax ({{ }})
+   and needs to connect to the Python server via Socket.IO.
+   
+   Opening it directly won't work because:
+   - No Flask server to process template
+   - No Socket.IO connection
+   - No API endpoints available
+
+═══════════════════════════════════════════════════════════════
+
+QUICK START (Windows):
+   
+   Option 1: Double-click start_server.bat
+   Option 2: Run: python web_server.py
+   
+   Then open browser to: http://localhost:5000
+
+═══════════════════════════════════════════════════════════════
+

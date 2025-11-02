@@ -1,0 +1,10 @@
+Flask==3.0.0
+flask-socketio==5.3.6
+pycryptodome==3.19.0
+speechrecognition==3.10.0
+spacy==3.7.2
+vosk==0.3.45
+pyaudio==0.2.14
+python-socketio==5.10.0
+eventlet==0.33.3
+
