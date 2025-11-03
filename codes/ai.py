@@ -1,6 +1,14 @@
-import speech_recognition as sr
-import spacy
-from spacy.lang.en.stop_words import STOP_WORDS
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+
+try:
+    import spacy
+    from spacy.lang.en.stop_words import STOP_WORDS
+except ImportError:
+    spacy = None
+    STOP_WORDS = set()
 from string import punctuation
 from heapq import nlargest
 import os
@@ -8,13 +16,19 @@ import json
 import wave
 import time
 from vosk import Model, KaldiRecognizer
-import pyaudio
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 
 # --- Setup for spaCy (Load model once) ---
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    print("\n[AI ERROR] spaCy model 'en_core_web_sm' not found. Please run 'python -m spacy download en_core_web_sm'")
+if spacy is not None:
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        print("\n[AI ERROR] spaCy model 'en_core_web_sm' not found. Please run 'python -m spacy download en_core_web_sm'")
+        nlp = None
+else:
     nlp = None
 
 
@@ -38,6 +52,8 @@ def voice_to_text():
     """
     if VOSK_MODEL is None:
         return "Voice-to-Text failed: Vosk model not loaded."
+    if pyaudio is None:
+        return "Voice-to-Text failed: PyAudio not installed."
 
     CHANNELS = 1
     RATE = 16000
@@ -116,6 +132,42 @@ def voice_to_text():
         return recognized_text.strip()
     else:
         return "Recognition did not capture clear speech."
+
+def transcribe_wav_bytes(wav_bytes):
+    """
+    Transcribe a WAV (PCM16 LE, mono, 16kHz recommended) byte stream using Vosk.
+    Returns recognized text or an error string.
+    """
+    if VOSK_MODEL is None:
+        return "Voice-to-Text failed: Vosk model not loaded."
+
+    try:
+        import io
+        with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
+            rate = wf.getframerate()
+            channels = wf.getnchannels()
+            width = wf.getsampwidth()
+
+            if channels != 1:
+                return "Transcription requires mono audio."
+            if width != 2:
+                return "Transcription requires 16-bit PCM WAV."
+
+            recognizer = KaldiRecognizer(VOSK_MODEL, rate)
+
+            # Read frames in chunks
+            text_accum = ""
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+                recognizer.AcceptWaveform(data)
+
+            result = json.loads(recognizer.FinalResult())
+            recognized_text = result.get('text', '').strip()
+            return recognized_text or ""
+    except Exception as e:
+        return f"Transcription error: {str(e)}"
     # --- 2. Local Text Summarization (FINAL REFINEMENT) ---
 
 def summarize_text(text, min_percentage=0.4):

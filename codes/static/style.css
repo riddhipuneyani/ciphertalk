@@ -292,6 +292,18 @@ body {
     transform: scale(1.1);
 }
 
+.btn-icon.recording {
+    background: #e74c3c;
+    color: white;
+    animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
+}
+
 .input-field {
     width: 100%;
     padding: 12px;

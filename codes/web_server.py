@@ -130,6 +130,36 @@ def api_get_encryptions():
         return jsonify({'encryptions': filtered})
     return jsonify({'encryptions': encryptions_log})
 
+@app.route('/api/transcribe', methods=['POST'])
+@rate_limit(max_calls=5, period=10)
+def api_transcribe():
+    try:
+        # Lazy import to avoid requiring optional deps at startup
+        try:
+            from ai import transcribe_wav_bytes
+        except ImportError:
+            return jsonify({'error': 'AI module not available. Install Vosk and related deps.'}), 503
+
+        if 'audio' not in request.files and not request.data:
+            return jsonify({'error': 'No audio provided'}), 400
+
+        # Support multipart form-data with file field 'audio' or raw body
+        wav_bytes = None
+        if 'audio' in request.files:
+            wav_bytes = request.files['audio'].read()
+        else:
+            wav_bytes = request.data
+
+        if not wav_bytes:
+            return jsonify({'error': 'Empty audio payload'}), 400
+
+        text = transcribe_wav_bytes(wav_bytes)
+        if text.startswith('Transcription error') or text.startswith('Voice-to-Text failed'):
+            return jsonify({'error': text}), 500
+        return jsonify({'text': text})
+    except Exception as e:
+        return jsonify({'error': f'Transcription failed: {str(e)}'}), 500
+
 @app.route('/api/analytics', methods=['GET'])
 def api_get_analytics():
     # Calculate analytics
@@ -245,7 +275,11 @@ def handle_disconnect():
     username = None
     if hasattr(socketio, 'user_sessions'):
         username = socketio.user_sessions.get(request.sid)
-        del socketio.user_sessions[request.sid]
+        # Safely remove without KeyError if missing
+        try:
+            socketio.user_sessions.pop(request.sid, None)
+        except Exception:
+            pass
     
     if not username:
         for user, data in list(active_users.items()):
@@ -282,8 +316,8 @@ def handle_register(data):
             socketio.user_sessions = {}
         socketio.user_sessions[request.sid] = username
         emit('registration_success', {'username': username, 'public_key': base64.b64encode(public_key).decode('utf-8')})
-        # Only broadcast to other users, not the registering user
-        socketio.emit('user_joined', {'username': username}, broadcast=True, include_self=False)
+        # Broadcast using context-bound emit to avoid Server.emit() kwargs mismatch
+        emit('user_joined', {'username': username}, broadcast=True, include_self=False)
         print(f'User {username} registered (Socket ID: {request.sid})')
 
 @socketio.on('get_public_key')

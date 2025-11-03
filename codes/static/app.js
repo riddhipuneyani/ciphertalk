@@ -369,9 +369,18 @@ function handleVoiceMessage() {
         alert('Please select a recipient first');
         return;
     }
-    
-    socket.emit('voice_message', {
-        recipient: currentRecipient
+    // Use browser STT only (simplest, no server deps)
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRec) {
+        alert('Speech recognition not supported in this browser. Please use Chrome or Edge on desktop and allow microphone access.');
+        return;
+    }
+    startBrowserSpeechRecognition((text) => {
+        if (text && text.trim()) {
+            socket.emit('send_message', { recipient: currentRecipient, message: text.trim() });
+        } else {
+            alert('No speech detected.');
+        }
     });
 }
 
@@ -660,9 +669,239 @@ function formatBytes(bytes) {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
 }
 
+// ---- Browser Speech Recognition (Web Speech API) ----
+function startBrowserSpeechRecognition(onResult) {
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRec) {
+        alert('Speech recognition not supported in this browser.');
+        return;
+    }
+    const btn = document.getElementById('voice-btn');
+    const prev = btn.textContent;
+    btn.textContent = '⏹';
+    btn.classList.add('recording');
+
+    const rec = new SpeechRec();
+    rec.lang = 'en-US';
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+
+    let stopped = false;
+    const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        try { rec.stop(); } catch {}
+        btn.textContent = prev;
+        btn.classList.remove('recording');
+        btn.removeEventListener('click', stop);
+    };
+    btn.addEventListener('click', stop);
+
+    rec.onresult = (event) => {
+        const text = event.results && event.results[0] && event.results[0][0]
+            ? event.results[0][0].transcript : '';
+        onResult(text);
+    };
+    rec.onerror = () => {
+        // Auto-fallback to server transcription using WAV recording
+        alert('Speech recognition error. Falling back to server transcription.');
+        stop();
+        startVoiceRecording(async (wavBlob) => {
+            try {
+                document.getElementById('voice-btn').classList.remove('recording');
+                const formData = new FormData();
+                formData.append('audio', wavBlob, 'recording.wav');
+                const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data && data.text) {
+                    socket.emit('send_message', { recipient: currentRecipient, message: data.text });
+                } else {
+                    alert('Transcription failed: ' + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                console.error('Voice send error', err);
+                alert('Voice message failed.');
+            }
+        });
+    };
+    rec.onend = () => {
+        stop();
+    };
+
+    try {
+        rec.start();
+        // Safety timeout
+        setTimeout(() => stop(), 10000);
+    } catch (e) {
+        stop();
+        alert('Could not start speech recognition.');
+    }
+}
+
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ---- Voice recording (WAV 16k mono) ----
+let mediaStream = null;
+let audioContext = null;
+let processor = null;
+let input = null;
+let recordedBuffers = [];
+let recordingSampleRate = 16000;
+let sourceSampleRate = 44100;
+let isRecording = false;
+
+async function startVoiceRecording(onComplete) {
+    if (isRecording) return;
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        sourceSampleRate = audioContext.sampleRate;
+        input = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        recordedBuffers = [];
+        isRecording = true;
+
+        processor.onaudioprocess = (e) => {
+            if (!isRecording) return;
+            const inputData = e.inputBuffer.getChannelData(0);
+            // Downsample to 16k and store Int16 samples
+            const downsampled = downsampleBuffer(inputData, sourceSampleRate, recordingSampleRate);
+            const int16 = floatTo16BitPCM(downsampled);
+            recordedBuffers.push(int16);
+        };
+
+        input.connect(processor);
+        processor.connect(audioContext.destination);
+
+        // Simple UX: toggle button text during recording
+        const btn = document.getElementById('voice-btn');
+        const prev = btn.textContent;
+        btn.textContent = '⏹';
+        btn.classList.add('recording');
+
+        // Stop after 10 seconds or on second click
+        const stopHandler = async () => {
+            btn.removeEventListener('click', stopHandler);
+            await stopRecordingInternal(btn, prev, onComplete);
+        };
+        btn.addEventListener('click', stopHandler);
+
+        setTimeout(async () => {
+            if (isRecording) {
+                btn.removeEventListener('click', stopHandler);
+                await stopRecordingInternal(btn, prev, onComplete);
+            }
+        }, 10000);
+    } catch (err) {
+        console.error('Mic access error', err);
+        alert('Microphone access denied or unavailable.');
+        isRecording = false;
+    }
+}
+
+async function stopRecordingInternal(btn, prev, onComplete) {
+    try {
+        isRecording = false;
+        processor && processor.disconnect();
+        input && input.disconnect();
+        mediaStream && mediaStream.getTracks().forEach(t => t.stop());
+        audioContext && audioContext.close();
+    } catch {}
+    btn.textContent = prev;
+    btn.classList.remove('recording');
+
+    // Build WAV
+    const combined = mergeBuffers(recordedBuffers);
+    const wavBlob = encodeWAV(combined, recordingSampleRate);
+    onComplete(wavBlob);
+}
+
+function downsampleBuffer(buffer, sampleRate, outRate) {
+    if (outRate === sampleRate) return buffer;
+    const sampleRateRatio = sampleRate / outRate;
+    const newLength = Math.round(buffer.length / sampleRateRatio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        let accum = 0, count = 0;
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+            accum += buffer[i];
+            count++;
+        }
+        result[offsetResult] = accum / count;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+}
+
+function floatTo16BitPCM(float32Array) {
+    const output = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return output;
+}
+
+function mergeBuffers(chunks) {
+    let totalLength = 0;
+    chunks.forEach(c => totalLength += c.length);
+    const result = new Int16Array(totalLength);
+    let offset = 0;
+    chunks.forEach(c => { result.set(c, offset); offset += c.length; });
+    return result;
+}
+
+function encodeWAV(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    /* RIFF identifier */
+    writeString(view, 0, 'RIFF');
+    /* file length */
+    view.setUint32(4, 36 + samples.length * 2, true);
+    /* RIFF type */
+    writeString(view, 8, 'WAVE');
+    /* format chunk identifier */
+    writeString(view, 12, 'fmt ');
+    /* format chunk length */
+    view.setUint32(16, 16, true);
+    /* sample format (raw) */
+    view.setUint16(20, 1, true);
+    /* channel count */
+    view.setUint16(22, 1, true);
+    /* sample rate */
+    view.setUint32(24, sampleRate, true);
+    /* byte rate (sample rate * block align) */
+    view.setUint32(28, sampleRate * 2, true);
+    /* block align (channel count * bytes per sample) */
+    view.setUint16(32, 2, true);
+    /* bits per sample */
+    view.setUint16(34, 16, true);
+    /* data chunk identifier */
+    writeString(view, 36, 'data');
+    /* data chunk length */
+    view.setUint32(40, samples.length * 2, true);
+
+    // PCM samples
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++, offset += 2) {
+        view.setInt16(offset, samples[i], true);
+    }
+
+    return new Blob([view], { type: 'audio/wav' });
+}
+
+function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+    }
 }
 
