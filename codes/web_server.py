@@ -27,6 +27,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 active_users = {}  # {username: {'socket_id': id, 'public_key': key}}
 messages_store = []  # Store all messages for history
 encryptions_log = []  # Store encryption operations
+verify_perf_log = []  # Store signature verification timings
 
 # Rate limiting for API calls
 api_call_times = {}  # {endpoint: {ip: [timestamps]}}
@@ -130,6 +131,195 @@ def api_get_encryptions():
         return jsonify({'encryptions': filtered})
     return jsonify({'encryptions': encryptions_log})
 
+@app.route('/api/hashing_details', methods=['GET'])
+def api_hashing_details():
+    try:
+        # Compute SHA-256 hashes of encryption components on the server
+        from Crypto.Hash import SHA256 as _SHA256
+        details = []
+        for enc in encryptions_log:
+            try:
+                sess = enc.get('session_key_encrypted') or ''
+                nonce = enc.get('nonce') or ''
+                cipher = enc.get('ciphertext') or ''
+                tag = enc.get('tag') or ''
+                sig = enc.get('signature') or ''
+
+                import base64 as _b64
+                def _h(b64s: str):
+                    try:
+                        raw = _b64.b64decode(b64s)
+                        return _SHA256.new(raw).hexdigest()
+                    except Exception:
+                        return None
+
+                details.append({
+                    'id': enc.get('id'),
+                    'timestamp': enc.get('timestamp'),
+                    'sender': enc.get('sender'),
+                    'recipient': enc.get('recipient'),
+                    'encryption_type': enc.get('encryption_type', 'RSA-AES-GCM'),
+                    'sha256': {
+                        'ciphertext': _h(cipher),
+                        'session_key': _h(sess),
+                        'nonce': _h(nonce),
+                        'tag': _h(tag),
+                        'signature': _h(sig),
+                    }
+                })
+            except Exception:
+                continue
+        return jsonify({'hashing': details})
+    except Exception as e:
+        return jsonify({'error': f'hashing details failed: {str(e)}'}), 500
+
+@app.route('/api/decrypt', methods=['POST'])
+@rate_limit(max_calls=5, period=10)
+def api_decrypt():
+    try:
+        data = request.get_json(silent=True) or {}
+        enc_id = data.get('id')
+        current_user = data.get('current_user')
+        if not enc_id or not current_user:
+            return jsonify({'error': 'id and current_user required'}), 400
+
+        # Locate encryption record
+        record = next((e for e in encryptions_log if e.get('id') == enc_id), None)
+        if not record:
+            # Attempt to find via messages_store
+            msg = next((m for m in messages_store if m.get('id') == enc_id), None)
+            if msg:
+                record = {
+                    'id': msg['id'],
+                    'recipient': msg['recipient'],
+                    'sender': msg['sender'],
+                    'session_key_encrypted': msg['encrypted_content']['session_key'],
+                    'nonce': msg['encrypted_content']['nonce'],
+                    'ciphertext': msg['encrypted_content']['ciphertext'],
+                    'tag': msg['encrypted_content']['tag']
+                }
+        if not record:
+            return jsonify({'error': 'Encryption record not found'}), 404
+
+        # Only recipient can decrypt (session key is encrypted for recipient)
+        if record.get('recipient') != current_user:
+            return jsonify({'error': 'Forbidden'}), 403
+
+        # Load recipient private key
+        private_key, _ = load_keys(current_user)
+        if not private_key:
+            return jsonify({'error': 'Private key not found for current user'}), 404
+
+        # Decode components
+        import base64 as _b64
+        try:
+            encrypted_session_key = _b64.b64decode(record['session_key_encrypted'])
+            nonce = _b64.b64decode(record['nonce'])
+            ciphertext = _b64.b64decode(record['ciphertext'])
+            tag = _b64.b64decode(record['tag'])
+        except Exception:
+            return jsonify({'error': 'Invalid encrypted payload'}), 400
+
+        # Decrypt
+        plaintext = decrypt_message(encrypted_session_key, nonce, ciphertext, tag, private_key)
+        if plaintext is None:
+            return jsonify({'error': 'Decryption failed'}), 500
+
+        # Return plaintext; frontend will trigger download without displaying
+        return jsonify({'ok': True, 'text': plaintext})
+    except Exception as e:
+        return jsonify({'error': f'Decrypt failed: {str(e)}'}), 500
+
+@app.route('/api/verify_signature', methods=['POST'])
+@rate_limit(max_calls=8, period=10)
+def api_verify_signature():
+    try:
+        data = request.get_json(silent=True) or {}
+        enc_id = data.get('id')
+        current_user = data.get('current_user')
+        if not enc_id:
+            return jsonify({'error': 'id required'}), 400
+
+        # Find record (prefer encryptions_log)
+        record = next((e for e in encryptions_log if e.get('id') == enc_id), None)
+        message_text = None
+        if not record:
+            msg = next((m for m in messages_store if m.get('id') == enc_id), None)
+            if msg:
+                record = {
+                    'id': msg['id'],
+                    'sender': msg['sender'],
+                    'recipient': msg['recipient'],
+                    'signature': msg.get('signature'),
+                }
+                message_text = msg.get('message')
+        else:
+            # Try find the plaintext in messages_store for exact signing input without returning it
+            msg = next((m for m in messages_store if m.get('id') == enc_id), None)
+            if msg:
+                message_text = msg.get('message')
+
+        if not record or not record.get('signature'):
+            return jsonify({'error': 'Signature not available'}), 404
+
+        sender = record.get('sender')
+        if not sender:
+            return jsonify({'error': 'Sender unknown'}), 400
+
+        # Get sender public key (from memory or disk)
+        if sender in active_users and active_users[sender].get('public_key'):
+            sender_pub = active_users[sender]['public_key']
+        else:
+            _, sender_pub = load_keys(sender)
+        if not sender_pub:
+            return jsonify({'error': 'Sender public key not found'}), 404
+
+        import base64 as _b64
+        try:
+            signature_bytes = _b64.b64decode(record['signature'])
+        except Exception:
+            return jsonify({'error': 'Invalid signature payload'}), 400
+
+        # If we don't have plaintext (e.g. server restarted), attempt server-side decrypt for recipient
+        if not message_text:
+            # Only attempt if we have encrypted parts and caller is the recipient
+            try:
+                if record.get('recipient') and current_user and record['recipient'] == current_user:
+                    import base64 as _b64
+                    priv, _ = load_keys(current_user)
+                    if priv and all(k in record for k in ('session_key_encrypted','nonce','ciphertext','tag')):
+                        enc_key = _b64.b64decode(record['session_key_encrypted'])
+                        n = _b64.b64decode(record['nonce'])
+                        ct = _b64.b64decode(record['ciphertext'])
+                        tg = _b64.b64decode(record['tag'])
+                        recovered = decrypt_message(enc_key, n, ct, tg, priv)
+                        if recovered:
+                            message_text = recovered
+            except Exception:
+                pass
+        # Still missing plaintext
+        if not message_text:
+            return jsonify({'ok': False, 'verified': False, 'reason': 'Plaintext unavailable on server for verification'}), 200
+
+        try:
+            import time as time_module
+            t0 = time_module.perf_counter()
+            is_ok = verify_signature(message_text, signature_bytes, sender_pub)
+            t1 = time_module.perf_counter()
+            verify_ms = (t1 - t0) * 1000
+            verify_perf_log.append({'timestamp': datetime.now().isoformat(), 'time_ms': round(verify_ms, 3)})
+        except Exception as e:
+            return jsonify({'ok': False, 'verified': False, 'reason': f'Verification error: {str(e)}'}), 200
+
+        return jsonify({
+            'ok': True,
+            'verified': bool(is_ok),
+            'algorithm': 'RSA + SHA-256',
+            'sender': sender
+        })
+    except Exception as e:
+        return jsonify({'error': f'Verify failed: {str(e)}'}), 500
+
 @app.route('/api/transcribe', methods=['POST'])
 @rate_limit(max_calls=5, period=10)
 def api_transcribe():
@@ -183,32 +373,73 @@ def api_get_analytics():
     min_encryption_time = min(encryption_times) if encryption_times else 0
     max_encryption_time = max(encryption_times) if encryption_times else 0
     
-    # Encryption time over time (for graph)
+    # Time series (per hour) for encryption, hashing, signing, verification
     encryption_time_series = []
+    hashing_time_series = []
+    signature_time_series = []
+    verification_time_series = []
+
     if encryptions_log:
         # Group by hour for the last 24 hours
-        time_groups = defaultdict(list)
-        now = datetime.now()
-        
+        enc_groups = defaultdict(list)
+        hash_groups = defaultdict(list)
+        sign_groups = defaultdict(list)
         for enc in encryptions_log:
-            if 'timestamp' in enc and 'encryption_time_ms' in enc:
-                try:
-                    enc_time = datetime.fromisoformat(enc['timestamp'])
-                    # Group by hour
-                    hour_key = enc_time.strftime('%Y-%m-%d %H:00')
-                    time_groups[hour_key].append(enc['encryption_time_ms'])
-                except:
-                    pass
-        
-        # Calculate average per hour
-        for hour_key in sorted(time_groups.keys())[-24:]:  # Last 24 hours
-            avg_time = sum(time_groups[hour_key]) / len(time_groups[hour_key])
-            encryption_time_series.append({
-                'time': hour_key,
-                'avg_time_ms': round(avg_time, 3),
-                'count': len(time_groups[hour_key])
-            })
+            if 'timestamp' not in enc:
+                continue
+            try:
+                enc_time = datetime.fromisoformat(enc['timestamp'])
+                hour_key = enc_time.strftime('%Y-%m-%d %H:00')
+                if 'encryption_time_ms' in enc:
+                    enc_groups[hour_key].append(enc['encryption_time_ms'])
+                if 'hash_time_ms' in enc:
+                    hash_groups[hour_key].append(enc['hash_time_ms'])
+                if 'signature_time_ms' in enc:
+                    sign_groups[hour_key].append(enc['signature_time_ms'])
+            except:
+                pass
+
+        for hour_key in sorted(enc_groups.keys())[-24:]:
+            avg_time = sum(enc_groups[hour_key]) / len(enc_groups[hour_key])
+            encryption_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(enc_groups[hour_key])})
+        for hour_key in sorted(hash_groups.keys())[-24:]:
+            avg_time = sum(hash_groups[hour_key]) / len(hash_groups[hour_key])
+            hashing_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(hash_groups[hour_key])})
+        for hour_key in sorted(sign_groups.keys())[-24:]:
+            avg_time = sum(sign_groups[hour_key]) / len(sign_groups[hour_key])
+            signature_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(sign_groups[hour_key])})
+
+    if verify_perf_log:
+        ver_groups = defaultdict(list)
+        for v in verify_perf_log:
+            try:
+                t = datetime.fromisoformat(v.get('timestamp'))
+                hour_key = t.strftime('%Y-%m-%d %H:00')
+                ver_groups[hour_key].append(v.get('time_ms', 0))
+            except:
+                pass
+        for hour_key in sorted(ver_groups.keys())[-24:]:
+            avg_time = sum(ver_groups[hour_key]) / len(ver_groups[hour_key])
+            verification_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(ver_groups[hour_key])})
     
+    # Hashing timing statistics
+    hashing_times = [enc.get('hash_time_ms', 0) for enc in encryptions_log if 'hash_time_ms' in enc]
+    avg_hash_time = sum(hashing_times) / len(hashing_times) if hashing_times else 0
+    min_hash_time = min(hashing_times) if hashing_times else 0
+    max_hash_time = max(hashing_times) if hashing_times else 0
+
+    # Signature timing statistics
+    signature_times = [enc.get('signature_time_ms', 0) for enc in encryptions_log if 'signature_time_ms' in enc]
+    avg_signature_time = sum(signature_times) / len(signature_times) if signature_times else 0
+    min_signature_time = min(signature_times) if signature_times else 0
+    max_signature_time = max(signature_times) if signature_times else 0
+
+    # Signature verification timing statistics
+    verify_times = [v.get('time_ms', 0) for v in verify_perf_log]
+    avg_verify_time = sum(verify_times) / len(verify_times) if verify_times else 0
+    min_verify_time = min(verify_times) if verify_times else 0
+    max_verify_time = max(verify_times) if verify_times else 0
+
     # Message size statistics
     message_sizes = [enc.get('message_size_bytes', 0) for enc in encryptions_log if 'message_size_bytes' in enc]
     avg_message_size = sum(message_sizes) / len(message_sizes) if message_sizes else 0
@@ -241,6 +472,12 @@ def api_get_analytics():
     # Performance metrics
     encryption_times_sorted = sorted(encryption_times) if encryption_times else []
     median_encryption_time = encryption_times_sorted[len(encryption_times_sorted) // 2] if encryption_times_sorted else 0
+    hashing_times_sorted = sorted(hashing_times) if hashing_times else []
+    median_hash_time = hashing_times_sorted[len(hashing_times_sorted) // 2] if hashing_times_sorted else 0
+    signature_times_sorted = sorted(signature_times) if signature_times else []
+    median_signature_time = signature_times_sorted[len(signature_times_sorted) // 2] if signature_times_sorted else 0
+    verify_times_sorted = sorted(verify_times) if verify_times else []
+    median_verify_time = verify_times_sorted[len(verify_times_sorted) // 2] if verify_times_sorted else 0
     
     return jsonify({
         'total_messages': total_messages,
@@ -256,12 +493,36 @@ def api_get_analytics():
             'median_ms': round(median_encryption_time, 3),
             'total_samples': len(encryption_times)
         },
+        'hashing_timing': {
+            'avg_ms': round(avg_hash_time, 3),
+            'min_ms': round(min_hash_time, 3),
+            'max_ms': round(max_hash_time, 3),
+            'median_ms': round(median_hash_time, 3),
+            'total_samples': len(hashing_times)
+        },
+        'signature_timing': {
+            'avg_ms': round(avg_signature_time, 3),
+            'min_ms': round(min_signature_time, 3),
+            'max_ms': round(max_signature_time, 3),
+            'median_ms': round(median_signature_time, 3),
+            'total_samples': len(signature_times)
+        },
+        'signature_verification_timing': {
+            'avg_ms': round(avg_verify_time, 3),
+            'min_ms': round(min_verify_time, 3),
+            'max_ms': round(max_verify_time, 3),
+            'median_ms': round(median_verify_time, 3),
+            'total_samples': len(verify_times)
+        },
         'encryption_time_series': encryption_time_series,
+        'hashing_time_series': hashing_time_series,
+        'signature_time_series': signature_time_series,
+        'verification_time_series': verification_time_series,
+        'verification_samples': verify_perf_log,
         'message_stats': {
             'avg_size_bytes': round(avg_message_size, 2),
             'total_size_bytes': sum(message_sizes)
-        },
-        'messages_per_hour': messages_per_hour_series
+        }
     })
 
 @socketio.on('connect')
@@ -366,14 +627,26 @@ def handle_send_message(data):
         return
     
     try:
-        # Track encryption time
+        # Track encryption/signing/hashing times
         import time as time_module
         encryption_start = time_module.perf_counter()
-        
-        # Encrypt message
+
+        # Sign timing
+        sign_start = time_module.perf_counter()
         signature = sign_message(message_text, sender_private_key)
+        sign_end = time_module.perf_counter()
+        signature_time_ms = (sign_end - sign_start) * 1000
+
+        # Hash timing (SHA-256 of plaintext)
+        hash_start = time_module.perf_counter()
+        from Crypto.Hash import SHA256 as _SHA256
+        _ = _SHA256.new(message_text.encode('utf-8')).digest()
+        hash_end = time_module.perf_counter()
+        hash_time_ms = (hash_end - hash_start) * 1000
+
+        # Encrypt
         encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
-        
+
         # Calculate encryption time
         encryption_end = time_module.perf_counter()
         encryption_time_ms = (encryption_end - encryption_start) * 1000  # Convert to milliseconds
@@ -390,6 +663,8 @@ def handle_send_message(data):
             'encryption_type': 'RSA-AES-GCM',
             'encryption_time_ms': round(encryption_time_ms, 3),
             'message_size_bytes': message_size,
+            'signature_time_ms': round(signature_time_ms, 3),
+            'hash_time_ms': round(hash_time_ms, 3),
             'session_key_encrypted': base64.b64encode(encrypted_session_key).decode('utf-8'),
             'nonce': base64.b64encode(nonce).decode('utf-8'),
             'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),

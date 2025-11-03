@@ -31,6 +31,8 @@
                 <div id="users-list" class="users-list"></div>
                 <div class="sidebar-actions">
                     <button id="view-encryptions-btn" class="btn-secondary">🔒 View Encryptions</button>
+                    <button id="view-hashing-btn" class="btn-secondary">🔐 Hashing</button>
+                    <button id="view-signature-btn" class="btn-secondary">✍️ Digital Signature</button>
                     <button id="view-analytics-btn" class="btn-secondary">📊 Analytics</button>
                 </div>
             </div>
@@ -75,6 +77,22 @@
                 <span class="close">&times;</span>
                 <h2>Analytics Dashboard</h2>
                 <div id="analytics-content" class="analytics-content"></div>
+            </div>
+        </div>
+
+        <div id="hashing-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <span class="close">&times;</span>
+                <h2>Hashing Details (SHA-256)</h2>
+                <div id="hashing-content" class="analytics-content"></div>
+            </div>
+        </div>
+
+        <div id="signature-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <span class="close">&times;</span>
+                <h2>Digital Signature Verification</h2>
+                <div id="signature-content" class="analytics-content"></div>
             </div>
         </div>
     </div>
