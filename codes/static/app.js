@@ -488,17 +488,21 @@ function handleVoiceMessage() {
         alert('Please select a recipient first');
         return;
     }
-    // Use browser STT only (simplest, no server deps)
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRec) {
-        alert('Speech recognition not supported in this browser. Please use Chrome or Edge on desktop and allow microphone access.');
-        return;
-    }
-    startBrowserSpeechRecognition((text) => {
-        if (text && text.trim()) {
-            socket.emit('send_message', { recipient: currentRecipient, message: text.trim() });
-        } else {
-            alert('No speech detected.');
+    // Always record WAV and transcribe once — single message for the entire audio
+    startVoiceRecording(async (wavBlob) => {
+        try {
+            const formData = new FormData();
+            formData.append('audio', wavBlob, 'recording.wav');
+            const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (data && data.text && data.text.trim()) {
+                socket.emit('send_message', { recipient: currentRecipient, message: data.text.trim() });
+            } else {
+                alert('Transcription failed: ' + (data && data.error ? data.error : 'Unknown error'));
+            }
+        } catch (err) {
+            console.error('Voice send error', err);
+            alert('Voice message failed.');
         }
     });
 }
@@ -888,14 +892,17 @@ function startBrowserSpeechRecognition(onResult) {
             }
         });
     };
+    // Keep recognition running until user presses the button
     rec.onend = () => {
-        stop();
+        if (!stopped) {
+            try { rec.start(); } catch {}
+        } else {
+            stop();
+        }
     };
 
     try {
         rec.start();
-        // Safety timeout
-        setTimeout(() => stop(), 10000);
     } catch (e) {
         stop();
         alert('Could not start speech recognition.');
@@ -947,19 +954,12 @@ async function startVoiceRecording(onComplete) {
         btn.textContent = '⏹';
         btn.classList.add('recording');
 
-        // Stop after 10 seconds or on second click
+        // Stop only on second click
         const stopHandler = async () => {
             btn.removeEventListener('click', stopHandler);
             await stopRecordingInternal(btn, prev, onComplete);
         };
         btn.addEventListener('click', stopHandler);
-
-        setTimeout(async () => {
-            if (isRecording) {
-                btn.removeEventListener('click', stopHandler);
-                await stopRecordingInternal(btn, prev, onComplete);
-            }
-        }, 10000);
     } catch (err) {
         console.error('Mic access error', err);
         alert('Microphone access denied or unavailable.');
