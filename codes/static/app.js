@@ -165,6 +165,8 @@ async function loadSignatureVerification() {
             const time = new Date(enc.timestamp).toLocaleString();
             const statusText = result.verified ? '✅ Verified' : '❌ Not Verified';
             const reasonText = result.reason ? ` — ${escapeHtml(result.reason)}` : '';
+            const sigFull = enc.signature || '';
+            const sigPreview = sigFull ? (sigFull.length > 80 ? sigFull.substring(0, 80) + '...' : sigFull) : 'N/A';
             rows.push(`
                 <div class="encryption-item">
                     <div class="encryption-item-header">
@@ -176,6 +178,7 @@ async function loadSignatureVerification() {
                         <div><strong>To:</strong> ${enc.recipient}</div>
                         <div><strong>Signature Status:</strong> ${statusText}${reasonText}</div>
                         ${result.algorithm ? `<div><strong>Algorithm:</strong> ${result.algorithm}</div>` : ''}
+                        <div><strong>Signature (base64):</strong> <code title="${sigFull}">${sigPreview}</code></div>
                     </div>
                 </div>
             `);
@@ -191,53 +194,83 @@ async function loadHashing() {
     const container = document.getElementById('hashing-content');
     container.innerHTML = '<p>Loading hashing details...</p>';
     try {
-        const response = await fetch('/api/encryptions');
-        const data = await response.json();
-        if (!data.encryptions || data.encryptions.length === 0) {
-            container.innerHTML = '<p>No encryption records found</p>';
-            return;
+        const secure = window.isSecureContext && window.crypto && window.crypto.subtle;
+        if (secure) {
+            // Client-side hashing (secure contexts only)
+            const response = await fetch('/api/encryptions');
+            const data = await response.json();
+            if (!data.encryptions || data.encryptions.length === 0) {
+                container.innerHTML = '<p>No encryption records found</p>';
+                return;
+            }
+            const itemsHtml = await Promise.all(data.encryptions.map(async (enc) => {
+                const toHex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                const b64ToBytes = (b64) => {
+                    const str = atob(b64 || '');
+                    const arr = new Uint8Array(str.length);
+                    for (let i = 0; i < str.length; i++) arr[i] = str.charCodeAt(i);
+                    return arr;
+                };
+                const sha256 = async (bytes) => {
+                    const digest = await crypto.subtle.digest('SHA-256', bytes);
+                    return toHex(digest);
+                };
+                const ts = new Date(enc.timestamp).toLocaleString();
+                const ciphHash = enc.ciphertext ? await sha256(b64ToBytes(enc.ciphertext)) : 'N/A';
+                const sessHash = enc.session_key_encrypted ? await sha256(b64ToBytes(enc.session_key_encrypted)) : 'N/A';
+                const nonceHash = enc.nonce ? await sha256(b64ToBytes(enc.nonce)) : 'N/A';
+                const tagHash = enc.tag ? await sha256(b64ToBytes(enc.tag)) : 'N/A';
+                const sigHash = enc.signature ? await sha256(b64ToBytes(enc.signature)) : 'N/A';
+                return `
+                    <div class="encryption-item">
+                        <div class="encryption-item-header">
+                            <div class="encryption-item-title">${enc.encryption_type || 'Encrypted Message'}</div>
+                            <div class="encryption-item-time">${ts}</div>
+                        </div>
+                        <div class="encryption-item-details">
+                            <div><strong>From:</strong> ${enc.sender}</div>
+                            <div><strong>To:</strong> ${enc.recipient}</div>
+                            <div><strong>SHA-256 (Ciphertext):</strong> <code>${ciphHash}</code></div>
+                            <div><strong>SHA-256 (Session Key):</strong> <code>${sessHash}</code></div>
+                            <div><strong>SHA-256 (Nonce):</strong> <code>${nonceHash}</code></div>
+                            <div><strong>SHA-256 (Tag):</strong> <code>${tagHash}</code></div>
+                            <div><strong>SHA-256 (Signature):</strong> <code>${sigHash}</code></div>
+                        </div>
+                    </div>
+                `;
+            }));
+            container.innerHTML = itemsHtml.join('');
+        } else {
+            // Server-side hashing fallback for non-secure contexts (e.g., http IP)
+            const response = await fetch('/api/hashing_details');
+            const data = await response.json();
+            if (!data.hashing || data.hashing.length === 0) {
+                container.innerHTML = '<p>No encryption records found</p>';
+                return;
+            }
+            const itemsHtml = data.hashing.map(item => {
+                const ts = new Date(item.timestamp).toLocaleString();
+                const h = item.sha256 || {};
+                return `
+                    <div class="encryption-item">
+                        <div class="encryption-item-header">
+                            <div class="encryption-item-title">${item.encryption_type || 'Encrypted Message'}</div>
+                            <div class="encryption-item-time">${ts}</div>
+                        </div>
+                        <div class="encryption-item-details">
+                            <div><strong>From:</strong> ${item.sender}</div>
+                            <div><strong>To:</strong> ${item.recipient}</div>
+                            <div><strong>SHA-256 (Ciphertext):</strong> <code>${h.ciphertext || 'N/A'}</code></div>
+                            <div><strong>SHA-256 (Session Key):</strong> <code>${h.session_key || 'N/A'}</code></div>
+                            <div><strong>SHA-256 (Nonce):</strong> <code>${h.nonce || 'N/A'}</code></div>
+                            <div><strong>SHA-256 (Tag):</strong> <code>${h.tag || 'N/A'}</code></div>
+                            <div><strong>SHA-256 (Signature):</strong> <code>${h.signature || 'N/A'}</code></div>
+                        </div>
+                    </div>
+                `;
+            });
+            container.innerHTML = itemsHtml.join('');
         }
-
-        const itemsHtml = await Promise.all(data.encryptions.map(async (enc) => {
-            const toHex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-            const b64ToBytes = (b64) => {
-                const str = atob(b64 || '');
-                const arr = new Uint8Array(str.length);
-                for (let i = 0; i < str.length; i++) arr[i] = str.charCodeAt(i);
-                return arr;
-            };
-            const sha256 = async (bytes) => {
-                const digest = await crypto.subtle.digest('SHA-256', bytes);
-                return toHex(digest);
-            };
-
-            const ts = new Date(enc.timestamp).toLocaleString();
-            const ciphHash = enc.ciphertext ? await sha256(b64ToBytes(enc.ciphertext)) : 'N/A';
-            const sessHash = enc.session_key_encrypted ? await sha256(b64ToBytes(enc.session_key_encrypted)) : 'N/A';
-            const nonceHash = enc.nonce ? await sha256(b64ToBytes(enc.nonce)) : 'N/A';
-            const tagHash = enc.tag ? await sha256(b64ToBytes(enc.tag)) : 'N/A';
-            const sigHash = enc.signature ? await sha256(b64ToBytes(enc.signature)) : 'N/A';
-
-            return `
-                <div class="encryption-item">
-                    <div class="encryption-item-header">
-                        <div class="encryption-item-title">${enc.encryption_type || 'Encrypted Message'}</div>
-                        <div class="encryption-item-time">${ts}</div>
-                    </div>
-                    <div class="encryption-item-details">
-                        <div><strong>From:</strong> ${enc.sender}</div>
-                        <div><strong>To:</strong> ${enc.recipient}</div>
-                        <div><strong>SHA-256 (Ciphertext):</strong> <code>${ciphHash}</code></div>
-                        <div><strong>SHA-256 (Session Key):</strong> <code>${sessHash}</code></div>
-                        <div><strong>SHA-256 (Nonce):</strong> <code>${nonceHash}</code></div>
-                        <div><strong>SHA-256 (Tag):</strong> <code>${tagHash}</code></div>
-                        <div><strong>SHA-256 (Signature):</strong> <code>${sigHash}</code></div>
-                    </div>
-                </div>
-            `;
-        }));
-
-        container.innerHTML = itemsHtml.join('');
     } catch (err) {
         console.error('Error loading hashing details:', err);
         container.innerHTML = '<p>Failed to load hashing details.</p>';

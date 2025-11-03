@@ -131,6 +131,48 @@ def api_get_encryptions():
         return jsonify({'encryptions': filtered})
     return jsonify({'encryptions': encryptions_log})
 
+@app.route('/api/hashing_details', methods=['GET'])
+def api_hashing_details():
+    try:
+        # Compute SHA-256 hashes of encryption components on the server
+        from Crypto.Hash import SHA256 as _SHA256
+        details = []
+        for enc in encryptions_log:
+            try:
+                sess = enc.get('session_key_encrypted') or ''
+                nonce = enc.get('nonce') or ''
+                cipher = enc.get('ciphertext') or ''
+                tag = enc.get('tag') or ''
+                sig = enc.get('signature') or ''
+
+                import base64 as _b64
+                def _h(b64s: str):
+                    try:
+                        raw = _b64.b64decode(b64s)
+                        return _SHA256.new(raw).hexdigest()
+                    except Exception:
+                        return None
+
+                details.append({
+                    'id': enc.get('id'),
+                    'timestamp': enc.get('timestamp'),
+                    'sender': enc.get('sender'),
+                    'recipient': enc.get('recipient'),
+                    'encryption_type': enc.get('encryption_type', 'RSA-AES-GCM'),
+                    'sha256': {
+                        'ciphertext': _h(cipher),
+                        'session_key': _h(sess),
+                        'nonce': _h(nonce),
+                        'tag': _h(tag),
+                        'signature': _h(sig),
+                    }
+                })
+            except Exception:
+                continue
+        return jsonify({'hashing': details})
+    except Exception as e:
+        return jsonify({'error': f'hashing details failed: {str(e)}'}), 500
+
 @app.route('/api/decrypt', methods=['POST'])
 @rate_limit(max_calls=5, period=10)
 def api_decrypt():
