@@ -130,6 +130,148 @@ def api_get_encryptions():
         return jsonify({'encryptions': filtered})
     return jsonify({'encryptions': encryptions_log})
 
+@app.route('/api/decrypt', methods=['POST'])
+@rate_limit(max_calls=5, period=10)
+def api_decrypt():
+    try:
+        data = request.get_json(silent=True) or {}
+        enc_id = data.get('id')
+        current_user = data.get('current_user')
+        if not enc_id or not current_user:
+            return jsonify({'error': 'id and current_user required'}), 400
+
+        # Locate encryption record
+        record = next((e for e in encryptions_log if e.get('id') == enc_id), None)
+        if not record:
+            # Attempt to find via messages_store
+            msg = next((m for m in messages_store if m.get('id') == enc_id), None)
+            if msg:
+                record = {
+                    'id': msg['id'],
+                    'recipient': msg['recipient'],
+                    'sender': msg['sender'],
+                    'session_key_encrypted': msg['encrypted_content']['session_key'],
+                    'nonce': msg['encrypted_content']['nonce'],
+                    'ciphertext': msg['encrypted_content']['ciphertext'],
+                    'tag': msg['encrypted_content']['tag']
+                }
+        if not record:
+            return jsonify({'error': 'Encryption record not found'}), 404
+
+        # Only recipient can decrypt (session key is encrypted for recipient)
+        if record.get('recipient') != current_user:
+            return jsonify({'error': 'Forbidden'}), 403
+
+        # Load recipient private key
+        private_key, _ = load_keys(current_user)
+        if not private_key:
+            return jsonify({'error': 'Private key not found for current user'}), 404
+
+        # Decode components
+        import base64 as _b64
+        try:
+            encrypted_session_key = _b64.b64decode(record['session_key_encrypted'])
+            nonce = _b64.b64decode(record['nonce'])
+            ciphertext = _b64.b64decode(record['ciphertext'])
+            tag = _b64.b64decode(record['tag'])
+        except Exception:
+            return jsonify({'error': 'Invalid encrypted payload'}), 400
+
+        # Decrypt
+        plaintext = decrypt_message(encrypted_session_key, nonce, ciphertext, tag, private_key)
+        if plaintext is None:
+            return jsonify({'error': 'Decryption failed'}), 500
+
+        # Return plaintext; frontend will trigger download without displaying
+        return jsonify({'ok': True, 'text': plaintext})
+    except Exception as e:
+        return jsonify({'error': f'Decrypt failed: {str(e)}'}), 500
+
+@app.route('/api/verify_signature', methods=['POST'])
+@rate_limit(max_calls=8, period=10)
+def api_verify_signature():
+    try:
+        data = request.get_json(silent=True) or {}
+        enc_id = data.get('id')
+        current_user = data.get('current_user')
+        if not enc_id:
+            return jsonify({'error': 'id required'}), 400
+
+        # Find record (prefer encryptions_log)
+        record = next((e for e in encryptions_log if e.get('id') == enc_id), None)
+        message_text = None
+        if not record:
+            msg = next((m for m in messages_store if m.get('id') == enc_id), None)
+            if msg:
+                record = {
+                    'id': msg['id'],
+                    'sender': msg['sender'],
+                    'recipient': msg['recipient'],
+                    'signature': msg.get('signature'),
+                }
+                message_text = msg.get('message')
+        else:
+            # Try find the plaintext in messages_store for exact signing input without returning it
+            msg = next((m for m in messages_store if m.get('id') == enc_id), None)
+            if msg:
+                message_text = msg.get('message')
+
+        if not record or not record.get('signature'):
+            return jsonify({'error': 'Signature not available'}), 404
+
+        sender = record.get('sender')
+        if not sender:
+            return jsonify({'error': 'Sender unknown'}), 400
+
+        # Get sender public key (from memory or disk)
+        if sender in active_users and active_users[sender].get('public_key'):
+            sender_pub = active_users[sender]['public_key']
+        else:
+            _, sender_pub = load_keys(sender)
+        if not sender_pub:
+            return jsonify({'error': 'Sender public key not found'}), 404
+
+        import base64 as _b64
+        try:
+            signature_bytes = _b64.b64decode(record['signature'])
+        except Exception:
+            return jsonify({'error': 'Invalid signature payload'}), 400
+
+        # If we don't have plaintext (e.g. server restarted), attempt server-side decrypt for recipient
+        if not message_text:
+            # Only attempt if we have encrypted parts and caller is the recipient
+            try:
+                if record.get('recipient') and current_user and record['recipient'] == current_user:
+                    import base64 as _b64
+                    priv, _ = load_keys(current_user)
+                    if priv and all(k in record for k in ('session_key_encrypted','nonce','ciphertext','tag')):
+                        enc_key = _b64.b64decode(record['session_key_encrypted'])
+                        n = _b64.b64decode(record['nonce'])
+                        ct = _b64.b64decode(record['ciphertext'])
+                        tg = _b64.b64decode(record['tag'])
+                        recovered = decrypt_message(enc_key, n, ct, tg, priv)
+                        if recovered:
+                            message_text = recovered
+            except Exception:
+                pass
+        # Still missing plaintext
+        if not message_text:
+            return jsonify({'ok': False, 'verified': False, 'reason': 'Plaintext unavailable on server for verification'}), 200
+
+        try:
+            is_ok = verify_signature(message_text, signature_bytes, sender_pub)
+        except Exception as e:
+            return jsonify({'ok': False, 'verified': False, 'reason': f'Verification error: {str(e)}'}), 200
+
+        return jsonify({
+            'ok': True,
+            'verified': bool(is_ok),
+            'algorithm': 'RSA + SHA-256',
+            'sender': sender
+        })
+    except Exception as e:
+        return jsonify({'error': f'Verify failed: {str(e)}'}), 500
+
 @app.route('/api/transcribe', methods=['POST'])
 @rate_limit(max_calls=5, period=10)
 def api_transcribe():

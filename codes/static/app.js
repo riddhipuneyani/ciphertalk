@@ -108,6 +108,18 @@ function setupEventListeners() {
         loadAnalytics();
     });
     
+    // View hashing
+    document.getElementById('view-hashing-btn').addEventListener('click', () => {
+        document.getElementById('hashing-modal').style.display = 'flex';
+        loadHashing();
+    });
+
+    // View digital signature verification
+    document.getElementById('view-signature-btn').addEventListener('click', () => {
+        document.getElementById('signature-modal').style.display = 'flex';
+        loadSignatureVerification();
+    });
+    
     // Close modals
     document.querySelectorAll('.close').forEach(closeBtn => {
         closeBtn.addEventListener('click', (e) => {
@@ -123,6 +135,113 @@ function setupEventListeners() {
             }
         });
     });
+}
+// ---- Digital Signature Verification ----
+async function loadSignatureVerification() {
+    const container = document.getElementById('signature-content');
+    container.innerHTML = '<p>Verifying signatures...</p>';
+    try {
+        const response = await fetch('/api/encryptions');
+        const data = await response.json();
+        if (!data.encryptions || data.encryptions.length === 0) {
+            container.innerHTML = '<p>No encryption records found</p>';
+            return;
+        }
+
+        const rows = [];
+        for (const enc of data.encryptions) {
+            let result = { ok: false, verified: false, reason: 'N/A' };
+            try {
+                const res = await fetch('/api/verify_signature', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: enc.id, current_user: currentUsername })
+                });
+                result = await res.json();
+            } catch (e) {
+                result = { ok: false, verified: false, reason: 'Network error' };
+            }
+
+            const time = new Date(enc.timestamp).toLocaleString();
+            const statusText = result.verified ? '✅ Verified' : '❌ Not Verified';
+            const reasonText = result.reason ? ` — ${escapeHtml(result.reason)}` : '';
+            rows.push(`
+                <div class="encryption-item">
+                    <div class="encryption-item-header">
+                        <div class="encryption-item-title">${enc.encryption_type || 'Encrypted Message'}</div>
+                        <div class="encryption-item-time">${time}</div>
+                    </div>
+                    <div class="encryption-item-details">
+                        <div><strong>From:</strong> ${enc.sender}</div>
+                        <div><strong>To:</strong> ${enc.recipient}</div>
+                        <div><strong>Signature Status:</strong> ${statusText}${reasonText}</div>
+                        ${result.algorithm ? `<div><strong>Algorithm:</strong> ${result.algorithm}</div>` : ''}
+                    </div>
+                </div>
+            `);
+        }
+        container.innerHTML = rows.join('');
+    } catch (err) {
+        console.error('Error loading signature verification:', err);
+        container.innerHTML = '<p>Failed to load signature verification details.</p>';
+    }
+}
+// ---- Hashing (SHA-256) ----
+async function loadHashing() {
+    const container = document.getElementById('hashing-content');
+    container.innerHTML = '<p>Loading hashing details...</p>';
+    try {
+        const response = await fetch('/api/encryptions');
+        const data = await response.json();
+        if (!data.encryptions || data.encryptions.length === 0) {
+            container.innerHTML = '<p>No encryption records found</p>';
+            return;
+        }
+
+        const itemsHtml = await Promise.all(data.encryptions.map(async (enc) => {
+            const toHex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+            const b64ToBytes = (b64) => {
+                const str = atob(b64 || '');
+                const arr = new Uint8Array(str.length);
+                for (let i = 0; i < str.length; i++) arr[i] = str.charCodeAt(i);
+                return arr;
+            };
+            const sha256 = async (bytes) => {
+                const digest = await crypto.subtle.digest('SHA-256', bytes);
+                return toHex(digest);
+            };
+
+            const ts = new Date(enc.timestamp).toLocaleString();
+            const ciphHash = enc.ciphertext ? await sha256(b64ToBytes(enc.ciphertext)) : 'N/A';
+            const sessHash = enc.session_key_encrypted ? await sha256(b64ToBytes(enc.session_key_encrypted)) : 'N/A';
+            const nonceHash = enc.nonce ? await sha256(b64ToBytes(enc.nonce)) : 'N/A';
+            const tagHash = enc.tag ? await sha256(b64ToBytes(enc.tag)) : 'N/A';
+            const sigHash = enc.signature ? await sha256(b64ToBytes(enc.signature)) : 'N/A';
+
+            return `
+                <div class="encryption-item">
+                    <div class="encryption-item-header">
+                        <div class="encryption-item-title">${enc.encryption_type || 'Encrypted Message'}</div>
+                        <div class="encryption-item-time">${ts}</div>
+                    </div>
+                    <div class="encryption-item-details">
+                        <div><strong>From:</strong> ${enc.sender}</div>
+                        <div><strong>To:</strong> ${enc.recipient}</div>
+                        <div><strong>SHA-256 (Ciphertext):</strong> <code>${ciphHash}</code></div>
+                        <div><strong>SHA-256 (Session Key):</strong> <code>${sessHash}</code></div>
+                        <div><strong>SHA-256 (Nonce):</strong> <code>${nonceHash}</code></div>
+                        <div><strong>SHA-256 (Tag):</strong> <code>${tagHash}</code></div>
+                        <div><strong>SHA-256 (Signature):</strong> <code>${sigHash}</code></div>
+                    </div>
+                </div>
+            `;
+        }));
+
+        container.innerHTML = itemsHtml.join('');
+    } catch (err) {
+        console.error('Error loading hashing details:', err);
+        container.innerHTML = '<p>Failed to load hashing details.</p>';
+    }
 }
 
 async function handleLogin() {
@@ -417,20 +536,65 @@ async function loadEncryptions() {
             const encItem = document.createElement('div');
             encItem.className = 'encryption-item';
             const time = new Date(enc.timestamp).toLocaleString();
+            const cipherPreview = (enc.ciphertext || '').substring(0, 48) + '...';
+            const sessPreview = (enc.session_key_encrypted || '').substring(0, 30) + '...';
+            const noncePreview = (enc.nonce || '').substring(0, 20) + '...';
+            const tagPreview = (enc.tag || '').substring(0, 20) + '...';
+            const sigPreview = (enc.signature || '').substring(0, 30) + '...';
             encItem.innerHTML = `
                 <div class="encryption-item-header">
-                    <div class="encryption-item-title">${enc.encryption_type}</div>
+                    <div class="encryption-item-title">${enc.encryption_type || 'Encrypted Message'}</div>
                     <div class="encryption-item-time">${time}</div>
                 </div>
                 <div class="encryption-item-details">
                     <div><strong>From:</strong> ${enc.sender}</div>
                     <div><strong>To:</strong> ${enc.recipient}</div>
-                    <div><strong>Session Key:</strong> <code>${enc.session_key_encrypted.substring(0, 30)}...</code></div>
-                    <div><strong>Nonce:</strong> <code>${enc.nonce.substring(0, 20)}...</code></div>
-                    <div><strong>Tag:</strong> <code>${enc.tag.substring(0, 20)}...</code></div>
+                    <div><strong>Ciphertext:</strong> <code title="Encrypted text">${cipherPreview}</code></div>
+                    <div><strong>Session Key:</strong> <code>${sessPreview}</code></div>
+                    <div><strong>Nonce:</strong> <code>${noncePreview}</code></div>
+                    <div><strong>Tag:</strong> <code>${tagPreview}</code></div>
+                    ${enc.signature ? `<div><strong>Signature:</strong> <code>${sigPreview}</code></div>` : ''}
+                    <div style="margin-top:10px; display:flex; gap:8px;">
+                        <button class="btn-secondary" data-decrypt-id="${enc.id}">Decrypt (download)</button>
+                    </div>
                 </div>
             `;
             encryptionsList.appendChild(encItem);
+        });
+
+        // Attach decrypt handlers
+        encryptionsList.querySelectorAll('[data-decrypt-id]').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const id = e.currentTarget.getAttribute('data-decrypt-id');
+                if (!id || !currentUsername) return;
+                try {
+                    const res = await fetch('/api/decrypt', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id, current_user: currentUsername })
+                    });
+                    const payload = await res.json();
+                    if (!res.ok || !payload.ok) {
+                        alert('Decrypt failed: ' + (payload.error || res.statusText));
+                        return;
+                    }
+                    // Create a temporary download without showing the text on screen
+                    const blob = new Blob([payload.text], { type: 'text/plain;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `decrypted-${id.substring(0,8)}.txt`;
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => {
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                    }, 0);
+                } catch (err) {
+                    console.error('Decrypt error', err);
+                    alert('Decrypt failed.');
+                }
+            });
         });
     } catch (error) {
         console.error('Error loading encryptions:', error);
