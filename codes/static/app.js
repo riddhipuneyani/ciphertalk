@@ -12,6 +12,7 @@ let lastLoadUsersTime = 0;
 document.addEventListener('DOMContentLoaded', () => {
     initializeSocket();
     setupEventListeners();
+    tryAutoLogin();
 });
 
 function initializeSocket() {
@@ -27,6 +28,11 @@ function initializeSocket() {
     
     socket.on('registration_success', (data) => {
         currentUsername = data.username;
+        // Persist login for refresh
+        try {
+            localStorage.setItem('ciphertalk_username', data.username);
+            localStorage.setItem('ciphertalk_public_key', data.public_key || '');
+        } catch {}
         document.getElementById('current-user').textContent = `Logged in as: ${data.username}`;
         document.getElementById('login-section').style.display = 'none';
         document.getElementById('conversations-section').style.display = 'block';
@@ -73,6 +79,31 @@ function initializeSocket() {
         console.log('Voice converted:', data.text);
     });
 }
+// Auto-login on refresh using localStorage
+async function tryAutoLogin() {
+    try {
+        if (currentUsername) return;
+        const storedUser = localStorage.getItem('ciphertalk_username');
+        if (!storedUser) return;
+        // Re-register via REST to get public key
+        const res = await fetch('/api/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: storedUser })
+        });
+        const data = await res.json();
+        if (data && data.success) {
+            // Register socket session
+            socket.emit('register', {
+                username: data.username,
+                public_key: data.public_key
+            });
+        }
+    } catch (e) {
+        console.warn('Auto-login failed', e);
+    }
+}
+
 
 function setupEventListeners() {
     // Login
@@ -313,6 +344,10 @@ function handleLogout() {
     currentUsername = '';
     currentRecipient = null;
     messages = [];
+    try {
+        localStorage.removeItem('ciphertalk_username');
+        localStorage.removeItem('ciphertalk_public_key');
+    } catch {}
     document.getElementById('current-user').textContent = 'Not logged in';
     document.getElementById('login-section').style.display = 'block';
     document.getElementById('conversations-section').style.display = 'none';
