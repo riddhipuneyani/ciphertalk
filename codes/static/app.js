@@ -617,6 +617,9 @@ async function loadAnalytics() {
         
         // Overall statistics
         const timing = data.encryption_timing || {};
+        const hashing = data.hashing_timing || {};
+        const signing = data.signature_timing || {};
+        const verifying = data.signature_verification_timing || {};
         const messageStats = data.message_stats || {};
         
         analyticsContent.innerHTML = `
@@ -664,6 +667,78 @@ async function loadAnalytics() {
                         <span class="stat-value">${timing.total_samples || 0}</span>
                     </div>
                 </div>
+
+                <div class="analytics-card">
+                    <h3>🔒 Hashing Performance</h3>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Avg Hash Time</span>
+                        <span class="stat-value">${hashing.avg_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Min Time</span>
+                        <span class="stat-value">${hashing.min_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Max Time</span>
+                        <span class="stat-value">${hashing.max_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Median Time</span>
+                        <span class="stat-value">${hashing.median_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Total Samples</span>
+                        <span class="stat-value">${hashing.total_samples || 0}</span>
+                    </div>
+                </div>
+
+                <div class="analytics-card">
+                    <h3>✍️ Signature Performance</h3>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Avg Sign Time</span>
+                        <span class="stat-value">${signing.avg_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Min Time</span>
+                        <span class="stat-value">${signing.min_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Max Time</span>
+                        <span class="stat-value">${signing.max_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Median Time</span>
+                        <span class="stat-value">${signing.median_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Total Samples</span>
+                        <span class="stat-value">${signing.total_samples || 0}</span>
+                    </div>
+                </div>
+
+                <div class="analytics-card">
+                    <h3>✅ Verification Performance</h3>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Avg Verify Time</span>
+                        <span class="stat-value">${verifying.avg_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Min Time</span>
+                        <span class="stat-value">${verifying.min_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Max Time</span>
+                        <span class="stat-value">${verifying.max_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Median Time</span>
+                        <span class="stat-value">${verifying.median_ms || 0} ms</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Total Samples</span>
+                        <span class="stat-value">${verifying.total_samples || 0}</span>
+                    </div>
+                </div>
                 
                 <div class="analytics-card">
                     <h3>💬 Message Statistics</h3>
@@ -678,142 +753,133 @@ async function loadAnalytics() {
                 </div>
             </div>
             
-            <div class="chart-container">
+            <div class="chart-container" style="height:320px;">
                 <h3>📈 Encryption Time Over Time</h3>
                 <canvas id="encryptionTimeChart"></canvas>
             </div>
-            
-            <div class="chart-container">
-                <h3>📊 Messages Per Hour</h3>
-                <canvas id="messagesPerHourChart"></canvas>
+            <div class="chart-container" style="height:320px;">
+                <h3>🔒 Hashing Time Over Time</h3>
+                <canvas id="hashingTimeChart"></canvas>
             </div>
+            <div class="chart-container" style="height:320px;">
+                <h3>✍️ Signature Time Over Time</h3>
+                <canvas id="signatureTimeChart"></canvas>
+            </div>
+            <div class="chart-container" style="height:320px;">
+                <h3>✅ Verification Time Over Time</h3>
+                <canvas id="verificationTimeChart"></canvas>
+            </div>
+            
+            
         `;
         
-        // Create encryption time chart
-        if (data.encryption_time_series && data.encryption_time_series.length > 0) {
+        // Fetch raw encryptions for per-sample charts (no averaging)
+        let encryptionsRaw = [];
+        try {
+            const encRes = await fetch('/api/encryptions');
+            const encJson = await encRes.json();
+            encryptionsRaw = Array.isArray(encJson.encryptions) ? encJson.encryptions : [];
+        } catch {}
+
+        // Build raw sample series from encryptions
+        const encSamples = encryptionsRaw
+            .filter(e => typeof e.encryption_time_ms === 'number' && e.timestamp)
+            .map(e => ({ time: e.timestamp, value: e.encryption_time_ms }));
+        const hashSamples = encryptionsRaw
+            .filter(e => typeof e.hash_time_ms === 'number' && e.timestamp)
+            .map(e => ({ time: e.timestamp, value: e.hash_time_ms }));
+        const signSamples = encryptionsRaw
+            .filter(e => typeof e.signature_time_ms === 'number' && e.timestamp)
+            .map(e => ({ time: e.timestamp, value: e.signature_time_ms }));
+
+        // Create encryption time chart (raw samples)
+        if (encSamples.length > 0) {
             const ctx1 = document.getElementById('encryptionTimeChart').getContext('2d');
-            
-            // Destroy existing chart if it exists
-            if (encryptionTimeChart) {
-                encryptionTimeChart.destroy();
-            }
-            
-            const labels = data.encryption_time_series.map(item => {
-                // Format time for display
-                const date = new Date(item.time);
-                return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit' });
+            if (encryptionTimeChart) { encryptionTimeChart.destroy(); }
+            const t0_raw = new Date(encSamples[0].time).getTime();
+            const t0 = isNaN(t0_raw) ? Date.now() : t0_raw;
+            const points = encSamples.map((s, idx) => {
+                const t = new Date(s.time).getTime();
+                const x = isNaN(t) ? idx : Math.max(0, Math.round((t - t0) / 1000));
+                return { x, y: s.value };
             });
-            const times = data.encryption_time_series.map(item => item.avg_time_ms);
-            const counts = data.encryption_time_series.map(item => item.count);
-            
+
             encryptionTimeChart = new Chart(ctx1, {
                 type: 'line',
                 data: {
-                    labels: labels,
                     datasets: [{
-                        label: 'Avg Encryption Time (ms)',
-                        data: times,
+                        label: 'Encryption Time (ms)',
+                        data: points,
                         borderColor: 'rgb(52, 152, 219)',
-                        backgroundColor: 'rgba(52, 152, 219, 0.1)',
-                        tension: 0.4,
-                        fill: true
+                        backgroundColor: 'rgba(52, 152, 219, 0.15)',
+                        tension: 0.35,
+                        fill: true,
+                        pointRadius: 2,
+                        pointHoverRadius: 4,
+                        borderWidth: 2
                     }]
                 },
                 options: {
                     responsive: true,
-                    plugins: {
-                        legend: {
-                            display: true
-                        },
-                        tooltip: {
-                            callbacks: {
-                                afterLabel: function(context) {
-                                    const index = context.dataIndex;
-                                    return `Count: ${counts[index]} encryptions`;
-                                }
-                            }
-                        }
-                    },
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: true } },
                     scales: {
-                        y: {
-                            beginAtZero: true,
-                            title: {
-                                display: true,
-                                text: 'Time (milliseconds)'
-                            }
-                        },
-                        x: {
-                            title: {
-                                display: true,
-                                text: 'Time'
-                            }
-                        }
+                        y: { beginAtZero: true, title: { display: true, text: 'Time (ms)' }, grid: { color: 'rgba(0,0,0,0.06)' } },
+                        x: { type: 'linear', title: { display: true, text: 'Time (s since first)' }, grid: { color: 'rgba(0,0,0,0.04)' } }
                     }
                 }
             });
         } else {
             document.getElementById('encryptionTimeChart').parentElement.innerHTML = 
-                '<p style="text-align: center; color: #7f8c8d; padding: 20px;">No encryption data available yet. Send some messages to see performance metrics!</p>';
+                '<p style="text-align: center; color: #7f8c8d; padding: 20px;">No encryption samples yet. Send some messages to see data.</p>';
+        }
+
+        // Hashing line chart (raw samples)
+        if (hashSamples.length > 0) {
+            const ctxH = document.getElementById('hashingTimeChart').getContext('2d');
+            const t0h_raw = new Date(hashSamples[0].time).getTime();
+            const t0_h = isNaN(t0h_raw) ? Date.now() : t0h_raw;
+            const pointsH = hashSamples.map((s, idx) => {
+                const t = new Date(s.time).getTime();
+                const x = isNaN(t) ? idx : Math.max(0, Math.round((t - t0_h) / 1000));
+                return { x, y: s.value };
+            });
+            new Chart(ctxH, { type: 'line', data: { datasets: [{ label: 'Hash Time (ms)', data: pointsH, borderColor: 'rgb(243, 156, 18)', backgroundColor: 'rgba(243, 156, 18, 0.15)', tension: 0.35, fill: true, pointRadius: 2, pointHoverRadius: 4, borderWidth: 2 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: true } }, scales: { y: { beginAtZero: true, title: { display: true, text: 'Time (ms)' }, grid: { color: 'rgba(0,0,0,0.06)' } }, x: { type: 'linear', title: { display: true, text: 'Time (s since first)' }, grid: { color: 'rgba(0,0,0,0.04)' } } } } });
+        } else {
+            document.getElementById('hashingTimeChart').parentElement.innerHTML = '<p style="text-align: center; color: #7f8c8d; padding: 20px;">No hashing samples yet.</p>';
+        }
+
+        // Signature line chart (raw samples)
+        if (signSamples.length > 0) {
+            const ctxS = document.getElementById('signatureTimeChart').getContext('2d');
+            const t0s_raw = new Date(signSamples[0].time).getTime();
+            const t0_s = isNaN(t0s_raw) ? Date.now() : t0s_raw;
+            const pointsS = signSamples.map((s, idx) => {
+                const t = new Date(s.time).getTime();
+                const x = isNaN(t) ? idx : Math.max(0, Math.round((t - t0_s) / 1000));
+                return { x, y: s.value };
+            });
+            new Chart(ctxS, { type: 'line', data: { datasets: [{ label: 'Sign Time (ms)', data: pointsS, borderColor: 'rgb(231, 76, 60)', backgroundColor: 'rgba(231, 76, 60, 0.15)', tension: 0.35, fill: true, pointRadius: 2, pointHoverRadius: 4, borderWidth: 2 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: true } }, scales: { y: { beginAtZero: true, title: { display: true, text: 'Time (ms)' }, grid: { color: 'rgba(0,0,0,0.06)' } }, x: { type: 'linear', title: { display: true, text: 'Time (s since first)' }, grid: { color: 'rgba(0,0,0,0.04)' } } } } });
+        } else {
+            document.getElementById('signatureTimeChart').parentElement.innerHTML = '<p style="text-align: center; color: #7f8c8d; padding: 20px;">No signing samples yet.</p>';
+        }
+
+        // Verification line chart (raw samples)
+        if (data.verification_samples && data.verification_samples.length > 0) {
+            const ctxV = document.getElementById('verificationTimeChart').getContext('2d');
+            const t0v_raw = new Date(data.verification_samples[0].timestamp).getTime();
+            const t0_v = isNaN(t0v_raw) ? Date.now() : t0v_raw;
+            const pointsV = data.verification_samples.map((item, idx) => {
+                const t = new Date(item.timestamp).getTime();
+                const x = isNaN(t) ? idx : Math.max(0, Math.round((t - t0_v) / 1000));
+                return { x, y: item.time_ms };
+            });
+            new Chart(ctxV, { type: 'line', data: { datasets: [{ label: 'Verify Time (ms)', data: pointsV, borderColor: 'rgb(46, 204, 113)', backgroundColor: 'rgba(46, 204, 113, 0.15)', tension: 0.35, fill: true, pointRadius: 2, pointHoverRadius: 4, borderWidth: 2 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: true } }, scales: { y: { beginAtZero: true, title: { display: true, text: 'Time (ms)' }, grid: { color: 'rgba(0,0,0,0.06)' } }, x: { type: 'linear', title: { display: true, text: 'Time (s since first)' }, grid: { color: 'rgba(0,0,0,0.04)' } } } } });
+        } else {
+            document.getElementById('verificationTimeChart').parentElement.innerHTML = '<p style="text-align: center; color: #7f8c8d; padding: 20px;">No verification samples yet.</p>';
         }
         
-        // Create messages per hour chart
-        if (data.messages_per_hour && data.messages_per_hour.length > 0) {
-            const ctx2 = document.getElementById('messagesPerHourChart').getContext('2d');
-            
-            // Destroy existing chart if it exists
-            if (messagesPerHourChart) {
-                messagesPerHourChart.destroy();
-            }
-            
-            const labels = data.messages_per_hour.map(item => {
-                const date = new Date(item.time);
-                return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit' });
-            });
-            const counts = data.messages_per_hour.map(item => item.count);
-            
-            messagesPerHourChart = new Chart(ctx2, {
-                type: 'bar',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Messages Sent',
-                        data: counts,
-                        backgroundColor: 'rgba(46, 204, 113, 0.7)',
-                        borderColor: 'rgb(46, 204, 113)',
-                        borderWidth: 1
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    plugins: {
-                        legend: {
-                            display: true
-                        }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            title: {
-                                display: true,
-                                text: 'Number of Messages'
-                            },
-                            ticks: {
-                                stepSize: 1
-                            }
-                        },
-                        x: {
-                            title: {
-                                display: true,
-                                text: 'Time'
-                            }
-                        }
-                    }
-                }
-            });
-        } else {
-            document.getElementById('messagesPerHourChart').parentElement.innerHTML = 
-                '<p style="text-align: center; color: #7f8c8d; padding: 20px;">No message activity data available yet.</p>';
-        }
+        // Removed messages per hour chart
         
     } catch (error) {
         console.error('Error loading analytics:', error);

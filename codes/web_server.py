@@ -27,6 +27,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 active_users = {}  # {username: {'socket_id': id, 'public_key': key}}
 messages_store = []  # Store all messages for history
 encryptions_log = []  # Store encryption operations
+verify_perf_log = []  # Store signature verification timings
 
 # Rate limiting for API calls
 api_call_times = {}  # {endpoint: {ip: [timestamps]}}
@@ -259,7 +260,12 @@ def api_verify_signature():
             return jsonify({'ok': False, 'verified': False, 'reason': 'Plaintext unavailable on server for verification'}), 200
 
         try:
+            import time as time_module
+            t0 = time_module.perf_counter()
             is_ok = verify_signature(message_text, signature_bytes, sender_pub)
+            t1 = time_module.perf_counter()
+            verify_ms = (t1 - t0) * 1000
+            verify_perf_log.append({'timestamp': datetime.now().isoformat(), 'time_ms': round(verify_ms, 3)})
         except Exception as e:
             return jsonify({'ok': False, 'verified': False, 'reason': f'Verification error: {str(e)}'}), 200
 
@@ -325,32 +331,73 @@ def api_get_analytics():
     min_encryption_time = min(encryption_times) if encryption_times else 0
     max_encryption_time = max(encryption_times) if encryption_times else 0
     
-    # Encryption time over time (for graph)
+    # Time series (per hour) for encryption, hashing, signing, verification
     encryption_time_series = []
+    hashing_time_series = []
+    signature_time_series = []
+    verification_time_series = []
+
     if encryptions_log:
         # Group by hour for the last 24 hours
-        time_groups = defaultdict(list)
-        now = datetime.now()
-        
+        enc_groups = defaultdict(list)
+        hash_groups = defaultdict(list)
+        sign_groups = defaultdict(list)
         for enc in encryptions_log:
-            if 'timestamp' in enc and 'encryption_time_ms' in enc:
-                try:
-                    enc_time = datetime.fromisoformat(enc['timestamp'])
-                    # Group by hour
-                    hour_key = enc_time.strftime('%Y-%m-%d %H:00')
-                    time_groups[hour_key].append(enc['encryption_time_ms'])
-                except:
-                    pass
-        
-        # Calculate average per hour
-        for hour_key in sorted(time_groups.keys())[-24:]:  # Last 24 hours
-            avg_time = sum(time_groups[hour_key]) / len(time_groups[hour_key])
-            encryption_time_series.append({
-                'time': hour_key,
-                'avg_time_ms': round(avg_time, 3),
-                'count': len(time_groups[hour_key])
-            })
+            if 'timestamp' not in enc:
+                continue
+            try:
+                enc_time = datetime.fromisoformat(enc['timestamp'])
+                hour_key = enc_time.strftime('%Y-%m-%d %H:00')
+                if 'encryption_time_ms' in enc:
+                    enc_groups[hour_key].append(enc['encryption_time_ms'])
+                if 'hash_time_ms' in enc:
+                    hash_groups[hour_key].append(enc['hash_time_ms'])
+                if 'signature_time_ms' in enc:
+                    sign_groups[hour_key].append(enc['signature_time_ms'])
+            except:
+                pass
+
+        for hour_key in sorted(enc_groups.keys())[-24:]:
+            avg_time = sum(enc_groups[hour_key]) / len(enc_groups[hour_key])
+            encryption_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(enc_groups[hour_key])})
+        for hour_key in sorted(hash_groups.keys())[-24:]:
+            avg_time = sum(hash_groups[hour_key]) / len(hash_groups[hour_key])
+            hashing_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(hash_groups[hour_key])})
+        for hour_key in sorted(sign_groups.keys())[-24:]:
+            avg_time = sum(sign_groups[hour_key]) / len(sign_groups[hour_key])
+            signature_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(sign_groups[hour_key])})
+
+    if verify_perf_log:
+        ver_groups = defaultdict(list)
+        for v in verify_perf_log:
+            try:
+                t = datetime.fromisoformat(v.get('timestamp'))
+                hour_key = t.strftime('%Y-%m-%d %H:00')
+                ver_groups[hour_key].append(v.get('time_ms', 0))
+            except:
+                pass
+        for hour_key in sorted(ver_groups.keys())[-24:]:
+            avg_time = sum(ver_groups[hour_key]) / len(ver_groups[hour_key])
+            verification_time_series.append({'time': hour_key, 'avg_time_ms': round(avg_time, 3), 'count': len(ver_groups[hour_key])})
     
+    # Hashing timing statistics
+    hashing_times = [enc.get('hash_time_ms', 0) for enc in encryptions_log if 'hash_time_ms' in enc]
+    avg_hash_time = sum(hashing_times) / len(hashing_times) if hashing_times else 0
+    min_hash_time = min(hashing_times) if hashing_times else 0
+    max_hash_time = max(hashing_times) if hashing_times else 0
+
+    # Signature timing statistics
+    signature_times = [enc.get('signature_time_ms', 0) for enc in encryptions_log if 'signature_time_ms' in enc]
+    avg_signature_time = sum(signature_times) / len(signature_times) if signature_times else 0
+    min_signature_time = min(signature_times) if signature_times else 0
+    max_signature_time = max(signature_times) if signature_times else 0
+
+    # Signature verification timing statistics
+    verify_times = [v.get('time_ms', 0) for v in verify_perf_log]
+    avg_verify_time = sum(verify_times) / len(verify_times) if verify_times else 0
+    min_verify_time = min(verify_times) if verify_times else 0
+    max_verify_time = max(verify_times) if verify_times else 0
+
     # Message size statistics
     message_sizes = [enc.get('message_size_bytes', 0) for enc in encryptions_log if 'message_size_bytes' in enc]
     avg_message_size = sum(message_sizes) / len(message_sizes) if message_sizes else 0
@@ -383,6 +430,12 @@ def api_get_analytics():
     # Performance metrics
     encryption_times_sorted = sorted(encryption_times) if encryption_times else []
     median_encryption_time = encryption_times_sorted[len(encryption_times_sorted) // 2] if encryption_times_sorted else 0
+    hashing_times_sorted = sorted(hashing_times) if hashing_times else []
+    median_hash_time = hashing_times_sorted[len(hashing_times_sorted) // 2] if hashing_times_sorted else 0
+    signature_times_sorted = sorted(signature_times) if signature_times else []
+    median_signature_time = signature_times_sorted[len(signature_times_sorted) // 2] if signature_times_sorted else 0
+    verify_times_sorted = sorted(verify_times) if verify_times else []
+    median_verify_time = verify_times_sorted[len(verify_times_sorted) // 2] if verify_times_sorted else 0
     
     return jsonify({
         'total_messages': total_messages,
@@ -398,12 +451,36 @@ def api_get_analytics():
             'median_ms': round(median_encryption_time, 3),
             'total_samples': len(encryption_times)
         },
+        'hashing_timing': {
+            'avg_ms': round(avg_hash_time, 3),
+            'min_ms': round(min_hash_time, 3),
+            'max_ms': round(max_hash_time, 3),
+            'median_ms': round(median_hash_time, 3),
+            'total_samples': len(hashing_times)
+        },
+        'signature_timing': {
+            'avg_ms': round(avg_signature_time, 3),
+            'min_ms': round(min_signature_time, 3),
+            'max_ms': round(max_signature_time, 3),
+            'median_ms': round(median_signature_time, 3),
+            'total_samples': len(signature_times)
+        },
+        'signature_verification_timing': {
+            'avg_ms': round(avg_verify_time, 3),
+            'min_ms': round(min_verify_time, 3),
+            'max_ms': round(max_verify_time, 3),
+            'median_ms': round(median_verify_time, 3),
+            'total_samples': len(verify_times)
+        },
         'encryption_time_series': encryption_time_series,
+        'hashing_time_series': hashing_time_series,
+        'signature_time_series': signature_time_series,
+        'verification_time_series': verification_time_series,
+        'verification_samples': verify_perf_log,
         'message_stats': {
             'avg_size_bytes': round(avg_message_size, 2),
             'total_size_bytes': sum(message_sizes)
-        },
-        'messages_per_hour': messages_per_hour_series
+        }
     })
 
 @socketio.on('connect')
@@ -508,14 +585,26 @@ def handle_send_message(data):
         return
     
     try:
-        # Track encryption time
+        # Track encryption/signing/hashing times
         import time as time_module
         encryption_start = time_module.perf_counter()
-        
-        # Encrypt message
+
+        # Sign timing
+        sign_start = time_module.perf_counter()
         signature = sign_message(message_text, sender_private_key)
+        sign_end = time_module.perf_counter()
+        signature_time_ms = (sign_end - sign_start) * 1000
+
+        # Hash timing (SHA-256 of plaintext)
+        hash_start = time_module.perf_counter()
+        from Crypto.Hash import SHA256 as _SHA256
+        _ = _SHA256.new(message_text.encode('utf-8')).digest()
+        hash_end = time_module.perf_counter()
+        hash_time_ms = (hash_end - hash_start) * 1000
+
+        # Encrypt
         encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
-        
+
         # Calculate encryption time
         encryption_end = time_module.perf_counter()
         encryption_time_ms = (encryption_end - encryption_start) * 1000  # Convert to milliseconds
@@ -532,6 +621,8 @@ def handle_send_message(data):
             'encryption_type': 'RSA-AES-GCM',
             'encryption_time_ms': round(encryption_time_ms, 3),
             'message_size_bytes': message_size,
+            'signature_time_ms': round(signature_time_ms, 3),
+            'hash_time_ms': round(hash_time_ms, 3),
             'session_key_encrypted': base64.b64encode(encrypted_session_key).decode('utf-8'),
             'nonce': base64.b64encode(nonce).decode('utf-8'),
             'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
