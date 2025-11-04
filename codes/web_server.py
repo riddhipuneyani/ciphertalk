@@ -128,7 +128,17 @@ def api_get_encryptions():
     username = request.args.get('username')
     if username:
         filtered = [e for e in encryptions_log if e['sender'] == username or e['recipient'] == username]
+        for enc in filtered:
+            if 'ciphertext' in enc:
+                ct = enc['ciphertext']
+                print(f"✓ API returning encryption {enc.get('id', 'unknown')[:8]}... - ciphertext: {len(ct)} chars")
         return jsonify({'encryptions': filtered})
+    
+    # Return all encryptions
+    for enc in encryptions_log:
+        if 'ciphertext' in enc:
+            ct = enc['ciphertext']
+            print(f"✓ API returning encryption {enc.get('id', 'unknown')[:8]}... - ciphertext: {len(ct)} chars")
     return jsonify({'encryptions': encryptions_log})
 
 @app.route('/api/hashing_details', methods=['GET'])
@@ -303,6 +313,11 @@ def api_verify_signature():
 
         try:
             import time as time_module
+            from Crypto.Hash import SHA256
+            # Compute the hash that's used for verification (same as in verify_signature)
+            message_hash = SHA256.new(message_text.encode('utf-8'))
+            hash_hex = message_hash.hexdigest()
+            
             t0 = time_module.perf_counter()
             is_ok = verify_signature(message_text, signature_bytes, sender_pub)
             t1 = time_module.perf_counter()
@@ -311,11 +326,18 @@ def api_verify_signature():
         except Exception as e:
             return jsonify({'ok': False, 'verified': False, 'reason': f'Verification error: {str(e)}'}), 200
 
+        # Recompute hash to verify it matches
+        recomputed_hash = SHA256.new(message_text.encode('utf-8')).hexdigest()
+        hash_match = (hash_hex == recomputed_hash)
+        
         return jsonify({
             'ok': True,
             'verified': bool(is_ok),
             'algorithm': 'RSA + SHA-256',
-            'sender': sender
+            'sender': sender,
+            'message_hash': hash_hex,
+            'recomputed_hash': recomputed_hash,
+            'hash_verified': hash_match
         })
     except Exception as e:
         return jsonify({'error': f'Verify failed: {str(e)}'}), 500
@@ -645,7 +667,22 @@ def handle_send_message(data):
         hash_time_ms = (hash_end - hash_start) * 1000
 
         # Encrypt
-        encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
+        try:
+            encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
+            
+            # Verify ciphertext is bytes and has correct length
+            if not isinstance(ciphertext, bytes):
+                raise ValueError(f"ciphertext is not bytes! Got type: {type(ciphertext)}")
+            
+            if len(ciphertext) < len(message_text):
+                raise ValueError(f"Ciphertext too short! Message: {len(message_text)} bytes, Ciphertext: {len(ciphertext)} bytes")
+            
+            print(f"✓ Encryption successful: message={len(message_text)} bytes, ciphertext={len(ciphertext)} bytes")
+            
+        except Exception as e:
+            print(f"✗ Encryption failed: {e}")
+            emit('error', {'message': f'Encryption failed: {str(e)}'})
+            return
 
         # Calculate encryption time
         encryption_end = time_module.perf_counter()
@@ -654,7 +691,22 @@ def handle_send_message(data):
         # Track message size
         message_size = len(message_text.encode('utf-8'))
         
+        # Base64 encode the ciphertext - ensure we get the full value
+        ciphertext_b64 = base64.b64encode(ciphertext).decode('utf-8')
+        print(f"✓ Ciphertext base64 encoded: {len(ciphertext_b64)} chars")
+        print(f"✓ FULL CIPHERTEXT VALUE: {ciphertext_b64}")
+        print(f"✓ CIPHERTEXT REPR: {repr(ciphertext_b64)}")
+        
         # Log encryption with timing data
+        # Create all base64 encodings first
+        session_key_b64 = base64.b64encode(encrypted_session_key).decode('utf-8')
+        nonce_b64 = base64.b64encode(nonce).decode('utf-8')
+        tag_b64 = base64.b64encode(tag).decode('utf-8')
+        signature_b64 = base64.b64encode(signature).decode('utf-8')
+        
+        # DOUBLE CHECK ciphertext_b64 before storing
+        print(f"⚠ BEFORE STORING: ciphertext_b64 length={len(ciphertext_b64)}, value={ciphertext_b64}")
+        
         encryption_record = {
             'id': str(uuid.uuid4()),
             'timestamp': datetime.now().isoformat(),
@@ -665,13 +717,33 @@ def handle_send_message(data):
             'message_size_bytes': message_size,
             'signature_time_ms': round(signature_time_ms, 3),
             'hash_time_ms': round(hash_time_ms, 3),
-            'session_key_encrypted': base64.b64encode(encrypted_session_key).decode('utf-8'),
-            'nonce': base64.b64encode(nonce).decode('utf-8'),
-            'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
-            'tag': base64.b64encode(tag).decode('utf-8'),
-            'signature': base64.b64encode(signature).decode('utf-8')
+            'session_key_encrypted': session_key_b64,
+            'nonce': nonce_b64,
+            'ciphertext': ciphertext_b64,  # Store the full base64 string
+            'tag': tag_b64,
+            'signature': signature_b64
         }
+        
+        # Verify what we stored IMMEDIATELY after creating the dict
+        stored_ct = encryption_record['ciphertext']
+        print(f"⚠ AFTER STORING IN DICT: encryption_record['ciphertext'] length={len(stored_ct)}")
+        print(f"⚠ AFTER STORING IN DICT: encryption_record['ciphertext'] value={stored_ct}")
+        print(f"⚠ MATCHES ORIGINAL: {stored_ct == ciphertext_b64}")
+        
+        if stored_ct != ciphertext_b64:
+            print(f"✗✗✗ ERROR: Ciphertext was modified when storing in dict!")
+            print(f"   Original: {ciphertext_b64}")
+            print(f"   Stored:   {stored_ct}")
+        
         encryptions_log.append(encryption_record)
+        
+        # Verify AFTER appending
+        last_record = encryptions_log[-1]
+        last_ct = last_record['ciphertext']
+        print(f"⚠ AFTER APPENDING: last_record['ciphertext'] length={len(last_ct)}")
+        print(f"⚠ AFTER APPENDING: last_record['ciphertext'] value={last_ct}")
+        if last_ct != ciphertext_b64:
+            print(f"✗✗✗ ERROR: Ciphertext was modified when appending to list!")
         
         # Create message object
         message_obj = {
