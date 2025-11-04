@@ -10,6 +10,7 @@ from functools import wraps
 from collections import defaultdict
 
 from crypto import generate_key_pair, encrypt_message, decrypt_message, sign_message, verify_signature
+import db
 
 # Optional AI imports - server will work without them
 try:
@@ -128,18 +129,32 @@ def api_get_encryptions():
     username = request.args.get('username')
     if username:
         filtered = [e for e in encryptions_log if e['sender'] == username or e['recipient'] == username]
-        for enc in filtered:
-            if 'ciphertext' in enc:
-                ct = enc['ciphertext']
-                print(f"✓ API returning encryption {enc.get('id', 'unknown')[:8]}... - ciphertext: {len(ct)} chars")
         return jsonify({'encryptions': filtered})
-    
-    # Return all encryptions
-    for enc in encryptions_log:
-        if 'ciphertext' in enc:
-            ct = enc['ciphertext']
-            print(f"✓ API returning encryption {enc.get('id', 'unknown')[:8]}... - ciphertext: {len(ct)} chars")
     return jsonify({'encryptions': encryptions_log})
+
+@app.route('/api/db/messages', methods=['GET'])
+def api_db_messages():
+    current_user = request.args.get('current_user')
+    if not current_user:
+        return jsonify({'messages': [], 'count': 0})
+    messages = db.load_user_messages(current_user)
+    return jsonify({'messages': messages, 'count': len(messages)})
+
+@app.route('/api/db/encryptions', methods=['GET'])
+def api_db_encryptions():
+    current_user = request.args.get('current_user')
+    if not current_user:
+        return jsonify({'encryptions': [], 'count': 0})
+    encryptions = db.load_user_encryptions(current_user)
+    return jsonify({'encryptions': encryptions, 'count': len(encryptions)})
+
+@app.route('/api/db/stats', methods=['GET'])
+def api_db_stats():
+    current_user = request.args.get('current_user')
+    if not current_user:
+        return jsonify({'total_messages': 0, 'total_encryptions': 0})
+    stats = db.get_user_stats(current_user)
+    return jsonify(stats)
 
 @app.route('/api/hashing_details', methods=['GET'])
 def api_hashing_details():
@@ -182,6 +197,63 @@ def api_hashing_details():
         return jsonify({'hashing': details})
     except Exception as e:
         return jsonify({'error': f'hashing details failed: {str(e)}'}), 500
+
+@app.route('/api/verify_hash', methods=['POST'])
+@rate_limit(max_calls=8, period=10)
+def api_verify_hash():
+    try:
+        data = request.get_json(silent=True) or {}
+        enc_id = data.get('id')
+        current_user = data.get('current_user')
+        if not enc_id or not current_user:
+            return jsonify({'error': 'id and current_user required'}), 400
+
+        # Find encryption record
+        record = next((e for e in encryptions_log if e.get('id') == enc_id), None)
+        if not record:
+            return jsonify({'error': 'Encryption record not found'}), 404
+
+        sender = record.get('sender')
+        recipient = record.get('recipient')
+        sent_hash = record.get('plaintext_hash')
+        if not sent_hash:
+            return jsonify({'ok': False, 'reason': 'No sender hash attached'}), 200
+
+        # Attempt to recover plaintext
+        plaintext = None
+        # If viewer is recipient, we can decrypt
+        if recipient == current_user:
+            import base64 as _b64
+            try:
+                priv, _ = load_keys(current_user)
+                if priv and all(k in record for k in ('session_key_encrypted','nonce','ciphertext','tag')):
+                    enc_key = _b64.b64decode(record['session_key_encrypted'])
+                    n = _b64.b64decode(record['nonce'])
+                    ct = _b64.b64decode(record['ciphertext'])
+                    tg = _b64.b64decode(record['tag'])
+                    recovered = decrypt_message(enc_key, n, ct, tg, priv)
+                    if recovered:
+                        plaintext = recovered
+            except Exception:
+                pass
+
+        # If viewer is sender, try to find matching message by signature
+        if plaintext is None and sender == current_user:
+            sig = record.get('signature')
+            if sig:
+                msg = next((m for m in messages_store if m.get('signature') == sig), None)
+                if msg:
+                    plaintext = msg.get('message')
+
+        if plaintext is None:
+            return jsonify({'ok': False, 'reason': 'Plaintext unavailable for verification'}), 200
+
+        # Compute hash of plaintext and compare
+        from Crypto.Hash import SHA256 as _SHA256
+        calc = _SHA256.new((plaintext or '').encode('utf-8')).hexdigest()
+        return jsonify({'ok': True, 'verified': calc == sent_hash, 'sent_hash': sent_hash, 'calc_hash': calc})
+    except Exception as e:
+        return jsonify({'error': f'verify hash failed: {str(e)}'}), 500
 
 @app.route('/api/decrypt', methods=['POST'])
 @rate_limit(max_calls=5, period=10)
@@ -313,11 +385,6 @@ def api_verify_signature():
 
         try:
             import time as time_module
-            from Crypto.Hash import SHA256
-            # Compute the hash that's used for verification (same as in verify_signature)
-            message_hash = SHA256.new(message_text.encode('utf-8'))
-            hash_hex = message_hash.hexdigest()
-            
             t0 = time_module.perf_counter()
             is_ok = verify_signature(message_text, signature_bytes, sender_pub)
             t1 = time_module.perf_counter()
@@ -326,18 +393,11 @@ def api_verify_signature():
         except Exception as e:
             return jsonify({'ok': False, 'verified': False, 'reason': f'Verification error: {str(e)}'}), 200
 
-        # Recompute hash to verify it matches
-        recomputed_hash = SHA256.new(message_text.encode('utf-8')).hexdigest()
-        hash_match = (hash_hex == recomputed_hash)
-        
         return jsonify({
             'ok': True,
             'verified': bool(is_ok),
             'algorithm': 'RSA + SHA-256',
-            'sender': sender,
-            'message_hash': hash_hex,
-            'recomputed_hash': recomputed_hash,
-            'hash_verified': hash_match
+            'sender': sender
         })
     except Exception as e:
         return jsonify({'error': f'Verify failed: {str(e)}'}), 500
@@ -662,27 +722,13 @@ def handle_send_message(data):
         # Hash timing (SHA-256 of plaintext)
         hash_start = time_module.perf_counter()
         from Crypto.Hash import SHA256 as _SHA256
-        _ = _SHA256.new(message_text.encode('utf-8')).digest()
+        _hasher = _SHA256.new(message_text.encode('utf-8'))
+        plaintext_hash_hex = _hasher.hexdigest()
         hash_end = time_module.perf_counter()
         hash_time_ms = (hash_end - hash_start) * 1000
 
         # Encrypt
-        try:
-            encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
-            
-            # Verify ciphertext is bytes and has correct length
-            if not isinstance(ciphertext, bytes):
-                raise ValueError(f"ciphertext is not bytes! Got type: {type(ciphertext)}")
-            
-            if len(ciphertext) < len(message_text):
-                raise ValueError(f"Ciphertext too short! Message: {len(message_text)} bytes, Ciphertext: {len(ciphertext)} bytes")
-            
-            print(f"✓ Encryption successful: message={len(message_text)} bytes, ciphertext={len(ciphertext)} bytes")
-            
-        except Exception as e:
-            print(f"✗ Encryption failed: {e}")
-            emit('error', {'message': f'Encryption failed: {str(e)}'})
-            return
+        encrypted_session_key, nonce, ciphertext, tag = encrypt_message(message_text, recipient_public_key)
 
         # Calculate encryption time
         encryption_end = time_module.perf_counter()
@@ -691,22 +737,7 @@ def handle_send_message(data):
         # Track message size
         message_size = len(message_text.encode('utf-8'))
         
-        # Base64 encode the ciphertext - ensure we get the full value
-        ciphertext_b64 = base64.b64encode(ciphertext).decode('utf-8')
-        print(f"✓ Ciphertext base64 encoded: {len(ciphertext_b64)} chars")
-        print(f"✓ FULL CIPHERTEXT VALUE: {ciphertext_b64}")
-        print(f"✓ CIPHERTEXT REPR: {repr(ciphertext_b64)}")
-        
         # Log encryption with timing data
-        # Create all base64 encodings first
-        session_key_b64 = base64.b64encode(encrypted_session_key).decode('utf-8')
-        nonce_b64 = base64.b64encode(nonce).decode('utf-8')
-        tag_b64 = base64.b64encode(tag).decode('utf-8')
-        signature_b64 = base64.b64encode(signature).decode('utf-8')
-        
-        # DOUBLE CHECK ciphertext_b64 before storing
-        print(f"⚠ BEFORE STORING: ciphertext_b64 length={len(ciphertext_b64)}, value={ciphertext_b64}")
-        
         encryption_record = {
             'id': str(uuid.uuid4()),
             'timestamp': datetime.now().isoformat(),
@@ -717,33 +748,18 @@ def handle_send_message(data):
             'message_size_bytes': message_size,
             'signature_time_ms': round(signature_time_ms, 3),
             'hash_time_ms': round(hash_time_ms, 3),
-            'session_key_encrypted': session_key_b64,
-            'nonce': nonce_b64,
-            'ciphertext': ciphertext_b64,  # Store the full base64 string
-            'tag': tag_b64,
-            'signature': signature_b64
+            'plaintext_hash': plaintext_hash_hex,
+            'session_key_encrypted': base64.b64encode(encrypted_session_key).decode('utf-8'),
+            'nonce': base64.b64encode(nonce).decode('utf-8'),
+            'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+            'tag': base64.b64encode(tag).decode('utf-8'),
+            'signature': base64.b64encode(signature).decode('utf-8')
         }
-        
-        # Verify what we stored IMMEDIATELY after creating the dict
-        stored_ct = encryption_record['ciphertext']
-        print(f"⚠ AFTER STORING IN DICT: encryption_record['ciphertext'] length={len(stored_ct)}")
-        print(f"⚠ AFTER STORING IN DICT: encryption_record['ciphertext'] value={stored_ct}")
-        print(f"⚠ MATCHES ORIGINAL: {stored_ct == ciphertext_b64}")
-        
-        if stored_ct != ciphertext_b64:
-            print(f"✗✗✗ ERROR: Ciphertext was modified when storing in dict!")
-            print(f"   Original: {ciphertext_b64}")
-            print(f"   Stored:   {stored_ct}")
-        
         encryptions_log.append(encryption_record)
-        
-        # Verify AFTER appending
-        last_record = encryptions_log[-1]
-        last_ct = last_record['ciphertext']
-        print(f"⚠ AFTER APPENDING: last_record['ciphertext'] length={len(last_ct)}")
-        print(f"⚠ AFTER APPENDING: last_record['ciphertext'] value={last_ct}")
-        if last_ct != ciphertext_b64:
-            print(f"✗✗✗ ERROR: Ciphertext was modified when appending to list!")
+        try:
+            db.save_encryption(encryption_record)
+        except Exception as _:
+            pass
         
         # Create message object
         message_obj = {
@@ -758,10 +774,15 @@ def handle_send_message(data):
                 'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
                 'tag': base64.b64encode(tag).decode('utf-8')
             },
-            'signature': base64.b64encode(signature).decode('utf-8')
+            'signature': base64.b64encode(signature).decode('utf-8'),
+            'plaintext_hash': plaintext_hash_hex
         }
         
         messages_store.append(message_obj)
+        try:
+            db.save_message(message_obj)
+        except Exception as _:
+            pass
         
         # Send to recipient if online
         recipient_socket_id = active_users[recipient]['socket_id']
@@ -771,7 +792,8 @@ def handle_send_message(data):
             'encrypted_content': message_obj['encrypted_content'],
             'signature': message_obj['signature'],
             'timestamp': message_obj['timestamp'],
-            'id': message_obj['id']
+            'id': message_obj['id'],
+            'hash': plaintext_hash_hex
         }, room=recipient_socket_id)
         
         # Confirm to sender
@@ -779,7 +801,8 @@ def handle_send_message(data):
             'recipient': recipient,
             'message': message_text,
             'timestamp': message_obj['timestamp'],
-            'id': message_obj['id']
+            'id': message_obj['id'],
+            'hash': plaintext_hash_hex
         })
         
         # Removed message_update broadcast - it was causing spam API calls
@@ -817,12 +840,15 @@ def handle_voice_message(data):
         emit('error', {'message': f'Voice conversion error: {str(e)}'})
 
 if __name__ == '__main__':
+    db.init_db()
+    print("✅ Database initialized")
     print("=" * 50)
     print("Starting CipherTalk Web Server...")
     print("=" * 50)
     print("\n📱 Open http://localhost:5000 in your browser")
     print("🔐 Secure messaging with end-to-end encryption")
     print("🎤 Voice-to-text support included")
+    print("💾 Database: ciphertalk.db")
     print("=" * 50 + "\n")
     socketio.run(app, debug=True, port=5000, host='0.0.0.0')
 
