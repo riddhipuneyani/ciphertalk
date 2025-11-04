@@ -247,11 +247,38 @@ async function loadHashing() {
                     return toHex(digest);
                 };
                 const ts = new Date(enc.timestamp).toLocaleString();
-                const ciphHash = enc.ciphertext ? await sha256(b64ToBytes(enc.ciphertext)) : 'N/A';
-                const sessHash = enc.session_key_encrypted ? await sha256(b64ToBytes(enc.session_key_encrypted)) : 'N/A';
-                const nonceHash = enc.nonce ? await sha256(b64ToBytes(enc.nonce)) : 'N/A';
-                const tagHash = enc.tag ? await sha256(b64ToBytes(enc.tag)) : 'N/A';
-                const sigHash = enc.signature ? await sha256(b64ToBytes(enc.signature)) : 'N/A';
+                const sessVal = enc.session_key_encrypted || '';
+                const sigVal = enc.signature || '';
+                const sessHash = sessVal ? await sha256(b64ToBytes(sessVal)) : 'N/A';
+                const sigHash = sigVal ? await sha256(b64ToBytes(sigVal)) : 'N/A';
+                
+                // Get message hash from verification endpoint
+                let msgHash = 'N/A';
+                let recomputedHash = 'N/A';
+                let hashVerified = false;
+                try {
+                    const verifyRes = await fetch('/api/verify_signature', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: enc.id, current_user: currentUsername })
+                    });
+                    const verifyData = await verifyRes.json();
+                    if (verifyData.message_hash) {
+                        msgHash = verifyData.message_hash;
+                    }
+                    if (verifyData.recomputed_hash) {
+                        recomputedHash = verifyData.recomputed_hash;
+                    }
+                    if (verifyData.hash_verified !== undefined) {
+                        hashVerified = verifyData.hash_verified;
+                    }
+                } catch (e) {
+                    // Ignore errors, keep N/A
+                }
+                
+                const preview = (v, max=60) => v && v.length > max ? v.substring(0, max) + '...' : v || 'N/A';
+                const verifiedStatus = msgHash !== 'N/A' && recomputedHash !== 'N/A' ? 
+                    (hashVerified ? '✅ Verified' : '❌ Mismatch') : '⚠️ Not Available';
                 return `
                     <div class="encryption-item">
                         <div class="encryption-item-header">
@@ -261,10 +288,12 @@ async function loadHashing() {
                         <div class="encryption-item-details">
                             <div><strong>From:</strong> ${enc.sender}</div>
                             <div><strong>To:</strong> ${enc.recipient}</div>
-                            <div><strong>SHA-256 (Ciphertext):</strong> <code>${ciphHash}</code></div>
+                            <div><strong>Received Hash (from verification):</strong> <code>${msgHash}</code></div>
+                            <div><strong>Recomputed Hash:</strong> <code>${recomputedHash}</code></div>
+                            <div><strong>Hash Verification:</strong> <strong style="color: ${hashVerified ? '#27ae60' : '#e74c3c'}">${verifiedStatus}</strong></div>
+                            <div><strong>Session Key (base64):</strong> <code title="${sessVal}">${preview(sessVal, 60)}</code></div>
                             <div><strong>SHA-256 (Session Key):</strong> <code>${sessHash}</code></div>
-                            <div><strong>SHA-256 (Nonce):</strong> <code>${nonceHash}</code></div>
-                            <div><strong>SHA-256 (Tag):</strong> <code>${tagHash}</code></div>
+                            <div><strong>Signature (base64):</strong> <code title="${sigVal}">${preview(sigVal, 60)}</code></div>
                             <div><strong>SHA-256 (Signature):</strong> <code>${sigHash}</code></div>
                         </div>
                     </div>
@@ -273,15 +302,54 @@ async function loadHashing() {
             container.innerHTML = itemsHtml.join('');
         } else {
             // Server-side hashing fallback for non-secure contexts (e.g., http IP)
-            const response = await fetch('/api/hashing_details');
-            const data = await response.json();
-            if (!data.hashing || data.hashing.length === 0) {
+            const [hashRes, encRes] = await Promise.all([
+                fetch('/api/hashing_details'),
+                fetch('/api/encryptions')
+            ]);
+            const hashData = await hashRes.json();
+            const encData = await encRes.json();
+            if (!hashData.hashing || hashData.hashing.length === 0) {
                 container.innerHTML = '<p>No encryption records found</p>';
                 return;
             }
-            const itemsHtml = data.hashing.map(item => {
+            const encMap = {};
+            if (encData.encryptions) {
+                encData.encryptions.forEach(e => { encMap[e.id] = e; });
+            }
+            const preview = (v, max=60) => v && v.length > max ? v.substring(0, max) + '...' : v || 'N/A';
+            const itemsHtml = await Promise.all(hashData.hashing.map(async (item) => {
                 const ts = new Date(item.timestamp).toLocaleString();
                 const h = item.sha256 || {};
+                const enc = encMap[item.id] || {};
+                const sessVal = enc.session_key_encrypted || '';
+                const sigVal = enc.signature || '';
+                
+                // Get message hash from verification endpoint
+                let msgHash = 'N/A';
+                let recomputedHash = 'N/A';
+                let hashVerified = false;
+                try {
+                    const verifyRes = await fetch('/api/verify_signature', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: item.id, current_user: currentUsername })
+                    });
+                    const verifyData = await verifyRes.json();
+                    if (verifyData.message_hash) {
+                        msgHash = verifyData.message_hash;
+                    }
+                    if (verifyData.recomputed_hash) {
+                        recomputedHash = verifyData.recomputed_hash;
+                    }
+                    if (verifyData.hash_verified !== undefined) {
+                        hashVerified = verifyData.hash_verified;
+                    }
+                } catch (e) {
+                    // Ignore errors, keep N/A
+                }
+                
+                const verifiedStatus = msgHash !== 'N/A' && recomputedHash !== 'N/A' ? 
+                    (hashVerified ? '✅ Verified' : '❌ Mismatch') : '⚠️ Not Available';
                 return `
                     <div class="encryption-item">
                         <div class="encryption-item-header">
@@ -291,15 +359,17 @@ async function loadHashing() {
                         <div class="encryption-item-details">
                             <div><strong>From:</strong> ${item.sender}</div>
                             <div><strong>To:</strong> ${item.recipient}</div>
-                            <div><strong>SHA-256 (Ciphertext):</strong> <code>${h.ciphertext || 'N/A'}</code></div>
+                            <div><strong>Received Hash (from verification):</strong> <code>${msgHash}</code></div>
+                            <div><strong>Recomputed Hash:</strong> <code>${recomputedHash}</code></div>
+                            <div><strong>Hash Verification:</strong> <strong style="color: ${hashVerified ? '#27ae60' : '#e74c3c'}">${verifiedStatus}</strong></div>
+                            <div><strong>Session Key (base64):</strong> <code title="${sessVal}">${preview(sessVal, 60)}</code></div>
                             <div><strong>SHA-256 (Session Key):</strong> <code>${h.session_key || 'N/A'}</code></div>
-                            <div><strong>SHA-256 (Nonce):</strong> <code>${h.nonce || 'N/A'}</code></div>
-                            <div><strong>SHA-256 (Tag):</strong> <code>${h.tag || 'N/A'}</code></div>
+                            <div><strong>Signature (base64):</strong> <code title="${sigVal}">${preview(sigVal, 60)}</code></div>
                             <div><strong>SHA-256 (Signature):</strong> <code>${h.signature || 'N/A'}</code></div>
                         </div>
                     </div>
                 `;
-            });
+            }));
             container.innerHTML = itemsHtml.join('');
         }
     } catch (err) {
@@ -608,7 +678,31 @@ async function loadEncryptions() {
             const encItem = document.createElement('div');
             encItem.className = 'encryption-item';
             const time = new Date(enc.timestamp).toLocaleString();
-            const cipherPreview = (enc.ciphertext || '').substring(0, 48) + '...';
+            // Get ciphertext - check both direct field and nested encrypted_content
+            let cipherFull = enc.ciphertext || (enc.encrypted_content && enc.encrypted_content.ciphertext) || 'N/A';
+            
+            // FORCE full ciphertext - make absolutely sure we have it
+            if (enc.ciphertext) {
+                cipherFull = String(enc.ciphertext); // Convert to string explicitly
+            } else if (enc.encrypted_content && enc.encrypted_content.ciphertext) {
+                cipherFull = String(enc.encrypted_content.ciphertext);
+            }
+            
+            console.log('=== CIPHERTEXT DEBUG ===');
+            console.log('Encryption ID:', enc.id);
+            console.log('enc.ciphertext exists:', !!enc.ciphertext);
+            console.log('enc.ciphertext type:', typeof enc.ciphertext);
+            console.log('enc.ciphertext length:', enc.ciphertext ? enc.ciphertext.length : 0);
+            console.log('enc.ciphertext FULL VALUE:', enc.ciphertext);
+            console.log('Final cipherFull length:', cipherFull ? cipherFull.length : 0);
+            console.log('Final cipherFull FULL VALUE:', cipherFull);
+            console.log('Full ciphertext displayed in textarea:', cipherFull && cipherFull.length > 0 ? 'YES' : 'NO');
+            if (cipherFull && cipherFull !== 'N/A') {
+                console.log('First 100 chars:', cipherFull.substring(0, 100));
+                console.log('Last 100 chars:', cipherFull.substring(Math.max(0, cipherFull.length - 100)));
+            }
+            console.log('========================');
+            
             const sessPreview = (enc.session_key_encrypted || '').substring(0, 30) + '...';
             const noncePreview = (enc.nonce || '').substring(0, 20) + '...';
             const tagPreview = (enc.tag || '').substring(0, 20) + '...';
@@ -621,7 +715,7 @@ async function loadEncryptions() {
                 <div class="encryption-item-details">
                     <div><strong>From:</strong> ${enc.sender}</div>
                     <div><strong>To:</strong> ${enc.recipient}</div>
-                    <div><strong>Ciphertext:</strong> <code title="Encrypted text">${cipherPreview}</code></div>
+                    <div><strong>Ciphertext (base64):</strong> <code style="word-break: break-all; white-space: pre-wrap; display: inline-block; max-width: 100%;">${escapeHtml(cipherFull)}</code></div>
                     <div><strong>Session Key:</strong> <code>${sessPreview}</code></div>
                     <div><strong>Nonce:</strong> <code>${noncePreview}</code></div>
                     <div><strong>Tag:</strong> <code>${tagPreview}</code></div>
